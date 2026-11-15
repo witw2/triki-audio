@@ -20,6 +20,7 @@ import math
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 import tkinter as tk
@@ -55,7 +56,8 @@ OLD_CONFIG_FILE = HERE / "triki_cap_config.json"
 ICON_FILE = HERE / "triki_audio.ico"
 NO_DEVICE = "Don't switch"
 LAYOUTS = {"Auto": "auto", "ABC=gyro, DEF=accel": "gyro_first", "ABC=accel, DEF=gyro": "accel_first"}
-RETRY_S = 5.0
+RETRY_S = 1.5          # pause between connection attempts (each attempt itself waits ~10 s)
+QUIET_S = 4.0          # no data for this long while connected = the cap went to sleep
 
 
 # ============================================================== small widgets
@@ -149,6 +151,9 @@ class App(ctk.CTk):
         self.ble_choice = V(tk.StringVar, "")
         self.startup_var = V(tk.BooleanVar, system.is_startup_enabled())
         self.dev_ids = {"up": "", "down": ""}
+        self.dev_names = {"up": "", "down": ""}   # remembered so an unplugged choice keeps its name
+        self._present_ids = set()
+        self._devices_checked_at = 0.0
         self.ble_address = ""
         self.ble_name = ""
 
@@ -159,7 +164,11 @@ class App(ctk.CTk):
         self.want_connected = False
         self.conn_state = "idle"       # idle / connecting / retry / calibrating / live / demo
         self.retry_at = 0.0
-        self.connecting = False
+        self.attempt = None            # (id, BackgroundTriki) while a connection attempt runs
+        self._attempt_seq = 0
+        self.asleep = False            # lost the cap, waiting for it to wake up
+        self.failed_attempts = 0
+        self.calib_snapshot = None     # reused on reconnect so a woken cap works immediately
         self.history = deque(maxlen=300)
         self.inbox = deque()
         self.rate, self._rate_mark = 0.0, (time.time(), 0)
@@ -554,48 +563,81 @@ class App(ctk.CTk):
             pass  # half-typed value - keep the previous settings
         return cfg
 
+    @property
+    def connecting(self):
+        return self.attempt is not None
+
     def _start(self, address=None, simulate=False):
-        if self.connecting or self.cap is not None:
+        if self.attempt is not None or self.cap is not None:
             return
-        self.connecting = True
+        self._attempt_seq += 1
+        attempt_id = self._attempt_seq
         self.simulated = simulate
         self.conn_state = "connecting"
         cap = triki.BackgroundTriki(address, self._apply_config(triki.Config()), simulate=simulate)
+        if not simulate and self._snapshot_fits():
+            cap.restore_calibration(self.calib_snapshot)
         cap.on("frame", self._on_frame)
         for name in ("calibrated", "twist", "flip", "tap", *GESTURES, "single_click"):
             cap.on(name, self.inbox.append)   # handled on the Tk thread
+        self.attempt = (attempt_id, cap)
 
         def worker():
             try:
-                cap.start(timeout=25)
-            except Exception as ex:
-                self.call_soon(lambda: self._connect_failed(ex))
+                cap.start(timeout=40)
+            except BaseException as ex:      # anything - the UI must always hear back
+                threading.Thread(target=cap.stop, daemon=True).start()
+                # bind ex now: Python deletes the name when the except block ends
+                self.call_soon(lambda ex=ex: self._connect_failed(attempt_id, ex))
                 return
-            self.call_soon(lambda: self._connected(cap))
+            self.call_soon(lambda: self._connected(attempt_id, cap))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _connected(self, cap):
-        self.connecting = False
-        if not self.want_connected and not self.simulated:  # cancelled meanwhile
+    def _snapshot_fits(self):
+        snap = self.calib_snapshot
+        if not snap:
+            return False
+        layout = LAYOUTS.get(self.layout.get(), "auto")
+        return layout == "auto" or (layout == "gyro_first") == (snap.get("gyro_axes") == "ABC")
+
+    def _connected(self, attempt_id, cap):
+        if self.attempt is None or self.attempt[0] != attempt_id:   # cancelled meanwhile
             threading.Thread(target=cap.stop, daemon=True).start()
-            self.conn_state = "idle"
             return
+        self.attempt = None
         self.cap = cap
         self.history.clear()
+        self.failed_attempts = 0
+        was_asleep, self.asleep = self.asleep, False
         self.conn_state = "calibrating"
-        self.set_status("Keep the cap still for a moment while it calibrates")
+        if was_asleep and not self.simulated and self.notify.get():
+            self.toast.show(Icon.BLUETOOTH, "Triki connected", "Awake and ready", theme.GOOD, seconds=1.4)
+        if cap.state.calibrating:
+            self.set_status("Keep the cap still for a moment while it calibrates")
 
-    def _connect_failed(self, ex):
-        self.connecting = False
+    def _connect_failed(self, attempt_id, ex):
+        if self.attempt is None or self.attempt[0] != attempt_id:   # cancelled meanwhile
+            return
+        self.attempt = None
         msg = str(ex) or ex.__class__.__name__
         if self.want_connected and not self.simulated:
+            self.failed_attempts += 1
+            if self.failed_attempts >= 2:
+                self.asleep = True
             self.conn_state, self.retry_at = "retry", time.time() + RETRY_S
-            self.set_status(f"Couldn't connect ({msg}) - retrying", RETRY_S)
+            if not self.asleep:
+                self.set_status(f"Couldn't connect ({msg}) - retrying", 4)
         else:
             self.conn_state = "idle"
             self.set_status(f"Couldn't connect: {msg}")
 
+    def _cancel_attempt(self):
+        attempt, self.attempt = self.attempt, None
+        if attempt is not None:
+            threading.Thread(target=attempt[1].stop, daemon=True).start()
+
     def _drop_cap(self):
+        self._cancel_attempt()
         cap, self.cap = self.cap, None
         if cap is not None:
             threading.Thread(target=cap.stop, daemon=True).start()
@@ -617,24 +659,28 @@ class App(ctk.CTk):
 
     def disconnect(self):
         self.want_connected = False
-        self._drop_cap()
+        self.asleep = False
+        self.failed_attempts = 0
+        self._drop_cap()          # also cancels a connection attempt that is still running
         self.conn_state = "idle"
+        self.simulated = False
         self.set_status("Disconnected")
 
     def toggle_connection(self):
-        if self.want_connected or self.simulated and self.cap:
+        if self.want_connected or (self.simulated and (self.cap is not None or self.attempt is not None)):
             self.disconnect()
-            self.simulated = False
         else:
             self.connect()
 
     def demo(self):
         self.want_connected = False
+        self.asleep = False
         self._drop_cap()
         self.after(200, lambda: self._start(simulate=True))
         self.set_status("Demo mode - motion is simulated, your audio is left alone")
 
     def calibrate(self):
+        self.calib_snapshot = None       # measure fresh; the result is saved again
         if self.cap:
             self.cap.calibrate()
             self.conn_state = "calibrating"
@@ -678,6 +724,7 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------- audio
     def refresh_audio_devices(self):
+        """Re-read Windows' output devices (also done automatically every few seconds)."""
         if not self.audio:
             self.set_status(f"Audio control unavailable: {self.audio_error}", 30)
             return
@@ -686,22 +733,54 @@ class App(ctk.CTk):
         except Exception as ex:
             self.set_status(f"Couldn't list audio devices: {ex}")
             return
-        self.out_devices = {}
+        self._apply_device_list(devs)
+
+    def _apply_device_list(self, devs, announce=False):
+        before = set(self._present_ids)
+        self._present_ids = {dev_id for dev_id, _ in devs}
+        present = {}
         for dev_id, name in devs:
-            label = name if name not in self.out_devices else f"{name} ({dev_id[-6:]})"
-            self.out_devices[label] = dev_id
+            label = name if name not in present else f"{name} ({dev_id[-6:]})"
+            present[label] = dev_id
+        self.out_devices = dict(present)
+        for face, dev_id in self.dev_ids.items():   # remember names while the devices are here
+            name = next((n for n, i in present.items() if i == dev_id), None)
+            if name:
+                self.dev_names[face] = name
+        for face, dev_id in self.dev_ids.items():   # chosen but unplugged: keep it selectable
+            if dev_id and dev_id not in self._present_ids:
+                label = f"{self.dev_names.get(face) or 'Saved device'} (not connected)"
+                self.out_devices.setdefault(label, dev_id)
         names = [NO_DEVICE] + list(self.out_devices)
         by_id = {v: k for k, v in self.out_devices.items()}
         for face, var in (("up", self.dev_up), ("down", self.dev_down)):
             self.face_rows[face][1].configure(values=names)
             var.set(by_id.get(self.dev_ids[face], NO_DEVICE))
+        if announce:
+            added = [n for n, i in present.items() if i not in before]
+            gone = len(before - self._present_ids)
+            if added:
+                self.set_status(f"New output device: {', '.join(added)}")
+            elif gone:
+                self.set_status(f"{gone} output device(s) disconnected")
+
+    def _poll_devices(self, now):
+        """Pick up devices plugged in or removed while the app runs."""
+        if now - self._devices_checked_at < 3.0:
+            return
+        self._devices_checked_at = now
+        devs = self.audio.list_outputs()
+        if {dev_id for dev_id, _ in devs} != self._present_ids:
+            self._apply_device_list(devs, announce=True)
 
     def _device_name(self, dev_id):
-        return next((n for n, i in self.out_devices.items() if i == dev_id), "output device")
+        name = next((n for n, i in self.out_devices.items() if i == dev_id), "output device")
+        return name.replace(" (not connected)", "")
 
     def _pick_device(self, face):
         var = self.dev_up if face == "up" else self.dev_down
         self.dev_ids[face] = self.out_devices.get(var.get(), "")
+        self.dev_names[face] = self._device_name(self.dev_ids[face]) if self.dev_ids[face] else ""
         self.save_config()
         if self.cap:
             self._switch_output(self.cap.state.face)
@@ -710,10 +789,15 @@ class App(ctk.CTk):
         if not (self.live and self.switch_enabled.get() and face):
             return
         target = self.dev_ids.get(face)
-        if target and target != self.audio.default_output_id():
+        if not target:
+            return
+        name = self._device_name(target)
+        if target not in self._present_ids:
+            self.set_status(f"{name} isn't connected - output not switched")
+            return
+        if target != self.audio.default_output_id():
             self.audio.set_default_output(target)
             self.vol_level = None
-            name = self._device_name(target)
             self.set_status(f"Output switched to {name}")
             if self.notify.get():
                 self.toast.show(Icon.HEADPHONES if face == "down" else Icon.SPEAKERS, name,
@@ -761,7 +845,12 @@ class App(ctk.CTk):
         while self.inbox:
             e = self.inbox.popleft()
             if e.name == "calibrated":
-                if e.value["still"]:
+                if not e.value.get("restored") and e.value["still"] and self.cap and not self.simulated:
+                    self.calib_snapshot = self.cap.calibration_snapshot()
+                    self.save_config()
+                if e.value.get("restored"):
+                    self.set_status("Ready")
+                elif e.value["still"]:
                     self.set_status("Calibrated - ready")
                 else:
                     self.set_status("The cap moved during calibration - press Calibrate to redo it")
@@ -868,6 +957,7 @@ class App(ctk.CTk):
             return
         try:
             self._handle_events()
+            self._poll_devices(now)
             if self.vol_level is None or now - self.vol_read_at > 1.0:
                 self.vol_level, self.vol_read_at = self.audio.get_volume(), now
                 self.mic_muted = self.audio.get_mic_muted()   # follow changes made elsewhere
@@ -882,17 +972,24 @@ class App(ctk.CTk):
             try:
                 self._calls.popleft()()
             except Exception as ex:
-                self.status_text = f"Error: {ex}"
+                self.status_text, self.status_until = f"Error: {ex}", now + 10
+                if sys.stderr:   # None under pythonw
+                    traceback.print_exc()
 
         cap = self.cap
         if cap is not None:
             self._apply_config(cap.config)
-            if not cap.is_connected:
+            quiet = cap.seconds_since_data > QUIET_S
+            if not cap.is_connected or quiet:
+                was_live = self.conn_state == "live"
                 self._drop_cap()
                 cap = None
                 if self.want_connected and not self.simulated:
+                    # A Triki that goes quiet or drops out has (almost always) gone to sleep.
+                    self.asleep = was_live or quiet or self.asleep
                     self.conn_state, self.retry_at = "retry", now + RETRY_S
-                    self.set_status("Connection lost - reconnecting")
+                    if not self.asleep:
+                        self.set_status("Connection lost - reconnecting")
                 else:
                     self.conn_state = "idle"
             elif self.conn_state in ("calibrating", "connecting"):
@@ -913,6 +1010,8 @@ class App(ctk.CTk):
 
     def _conn_display(self, now):
         s = self.conn_state
+        if s in ("retry", "connecting") and self.asleep:
+            return "Asleep - press the button to wake", theme.FAINT
         if s == "live":
             return "Connected", theme.GOOD
         if s == "demo":
@@ -946,6 +1045,8 @@ class App(ctk.CTk):
 
         badge = {"live": theme.GOOD, "demo": theme.INFO, "calibrating": theme.INFO,
                  "connecting": theme.WARN, "retry": theme.WARN}.get(self.conn_state)
+        if self.asleep and self.conn_state in ("retry", "connecting"):
+            badge = theme.FAINT
         if self.mic_muted and self.conn_state == "live":
             badge = theme.BAD
         self.tray.update(badge, "Triki Audio - " + self.tray_status_text())
@@ -1077,9 +1178,10 @@ class App(ctk.CTk):
     def save_config(self):
         try:
             data = {k: getattr(self, k).get() for k in self.CONFIG_KEYS}
+            data["calibration"] = self.calib_snapshot
             data["actions"] = {g: {"action": self._action_id(g), "arg": self.action_args[g].get()}
                                for g in GESTURES}
-            data.update(dev_ids=self.dev_ids, ble_address=self.ble_address, ble_name=self.ble_name,
+            data.update(dev_ids=self.dev_ids, dev_names=self.dev_names, ble_address=self.ble_address, ble_name=self.ble_name,
                         badge_pos=list(self.badge.pos) if getattr(self, "badge", None) and self.badge.pos
                         else self.badge_pos)
             CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -1101,8 +1203,10 @@ class App(ctk.CTk):
         if self.layout.get() not in LAYOUTS:
             self.layout.set("Auto")
         self.dev_ids.update({k: v for k, v in data.get("dev_ids", {}).items() if k in self.dev_ids})
+        self.dev_names.update({k: v for k, v in data.get("dev_names", {}).items() if k in self.dev_names})
         self.ble_address = data.get("ble_address", "")
         self.ble_name = data.get("ble_name", "")
+        self.calib_snapshot = data.get("calibration") or None
         saved = data.get("actions")
         if saved is None and data.get("mic_enabled") is False:   # settings from before Actions existed
             saved = {"click": {"action": "none"}}
