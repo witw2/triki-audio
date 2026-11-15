@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+
+# personal settings (Bluetooth address, audio device IDs) and generated files
+triki_audio_config.json
+triki_cap_config.json
+triki_audio.ico

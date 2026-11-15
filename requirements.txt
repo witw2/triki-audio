@@ -1,0 +1,5 @@
+# Triki Audio dependencies (Windows 10/11, Python 3.9+)
+triki[windows] @ git+https://github.com/witw2/triki-py.git
+customtkinter==5.2.2
+pystray==0.19.5
+Pillow>=10
