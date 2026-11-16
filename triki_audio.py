@@ -50,7 +50,7 @@ except Exception as _err:  # comtypes missing / not Windows
 import actions
 import system
 import theme
-from actions import ACTIONS, ARG_HINTS, BUTTON_GESTURES, DEFAULT_ARGS, DEFAULTS, GESTURES, LABEL_TO_ID
+from actions import ACTIONS, ARG_HINTS, BUTTON_GESTURES, DEFAULT_ARGS, DEFAULTS, GESTURES, LABEL_TO_ID, MAX_STEPS
 import media
 from cap_view import CapView, Scope
 from overlay import MutedBadge, Toast
@@ -66,6 +66,9 @@ ICON_FILE = DATA_DIR / "triki_audio.ico"
 NO_DEVICE = "Don't switch"
 PANEL_MIN, PANEL_MAX = 410, 560     # side panel width in app units (grows on big windows)
 MIC_MODES = ("Click to toggle", "Hold to talk")
+PERF_MODES = ("Smooth", "Light", "Minimal")
+# mode -> (3D view quality or None = off, draw every Nth tick, main-loop interval in ms)
+PERF = {"Smooth": ("high", 1, 33), "Light": ("low", 3, 33), "Minimal": (None, 4, 50)}
 # library events the app reacts to
 TRIKI_EVENTS = ("calibrated", "twist", "flip", "tap", "double_tap", "shake", "press", "release",
                 "click", "single_click", "double_click", "long_press", "battery")
@@ -150,14 +153,16 @@ class App(ctk.CTk):
         self.switch_hold = V(tk.DoubleVar, 0.1)
         self.auto_connect = V(tk.BooleanVar, True)
         self.close_to_tray = V(tk.BooleanVar, True)
+        self.perf_mode = V(tk.StringVar, PERF_MODES[0])   # lighter UI for slow PCs
+        self._tick_no = 0
         self.notify = V(tk.BooleanVar, True)
         self.mic_badge = V(tk.BooleanVar, True)
         self.upside_down = V(tk.BooleanVar, True)   # this Triki's sensor sits flipped in the cap
         self.badge_pos = None
         self.tap_threshold = V(tk.DoubleVar, 0.15)
         self.double_tap_window = V(tk.DoubleVar, 0.5)
-        self.action_vars = {g: V(tk.StringVar, ACTIONS[DEFAULTS[g]][0]) for g in GESTURES}
-        self.action_args = {g: V(tk.StringVar, DEFAULT_ARGS.get(g, "")) for g in GESTURES}
+        # gesture -> chain of steps {"action": id, "arg": text}; run one after another
+        self.chains = {g: [{"action": DEFAULTS[g], "arg": DEFAULT_ARGS.get(g, "")}] for g in GESTURES}
         self._impact_hold = 0.0        # strongest knock since the last screen update (triki thread)
         self.mic_mode = V(tk.StringVar, MIC_MODES[0])
         self.shake_force = V(tk.DoubleVar, 2.5)       # g away from gravity that counts as a shake jolt
@@ -227,6 +232,7 @@ class App(ctk.CTk):
         self.toast = Toast(self)
         self.badge = MutedBadge(self, on_moved=self._badge_moved)
         self.badge.pos = self.badge_pos
+        self._perf_changed(save=False)
         if not selftest:
             self.tray.start()
         self.media.start()
@@ -294,7 +300,11 @@ class App(ctk.CTk):
         stage.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
         self.view = CapView(stage, bg=theme.SURFACE)
         self.view.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-        chips = ctk.CTkFrame(stage, fg_color="transparent")
+        self.view_off = ctk.CTkLabel(stage, text="3D view is off (Minimal performance mode)\n"
+                                                  "Device tab \u2192 Performance to turn it back on",
+                                     font=F["small"], text_color=theme.FAINT)
+        self._stage_view_parent = stage
+        chips = self.chips_frame = ctk.CTkFrame(stage, fg_color="transparent")
         chips.pack(fill="x", padx=16, pady=16)
         self.chip_face = Chip(chips, "Position", F)
         self.chip_tilt = Chip(chips, "Tilt", F)
@@ -546,30 +556,20 @@ class App(ctk.CTk):
 
         card = Card(root, "\uE7C9", "Gestures", F)
         card.pack(fill="x", pady=(0, 12))
-        self.arg_entries = {}
-        labels = [label for label, _i, _a in ACTIONS.values()]
+        self.chain_boxes = {}
         for g, text in GESTURES.items():
             row = ctk.CTkFrame(card.body, fg_color=theme.SURFACE_2, corner_radius=12)
             row.pack(fill="x", pady=4)
             inner = ctk.CTkFrame(row, fg_color="transparent")
             inner.pack(fill="x", padx=12, pady=10)
             ctk.CTkLabel(inner, text=text, font=F["body"], text_color=theme.TEXT, anchor="w").pack(fill="x")
-            self._option(inner, self.action_vars[g], labels, width=300,
-                         command=lambda _v, g=g: self._action_changed(g)).pack(fill="x", pady=(4, 0))
             box = ctk.CTkFrame(inner, fg_color="transparent")
-            entry = ctk.CTkEntry(box, textvariable=self.action_args[g], height=32, corner_radius=8,
-                                 fg_color=theme.BG, border_color=theme.BORDER, text_color=theme.TEXT,
-                                 font=F["body"])
-            entry.pack(fill="x")
-            entry.bind("<FocusOut>", lambda _e: self.save_config())
-            box.hint = ctk.CTkLabel(box, text="", font=F["small"], text_color=theme.FAINT, anchor="w")
-            box.hint.pack(fill="x")
-            self.arg_entries[g] = box
-            aid = self._action_id(g)
-            if ACTIONS[aid][2]:
-                box.hint.configure(text=ARG_HINTS[aid])
-                box.pack(fill="x", pady=(6, 0))
-        self._label(card.body, "Twist (volume) and flip (output device) are set on the Controls tab. "
+            box.pack(fill="x")
+            self.chain_boxes[g] = box
+            self._render_chain(g)
+        self._label(card.body, "Each gesture can run several actions in a row - use '+ Add action'. "
+                               "Turning the cap face up / down also switches the output device if that is "
+                               "on (Controls tab); turn it off there to use flips only for these actions. "
                                "Button gestures are off while the mic is in 'Hold to talk' mode. "
                                "Actions only run while a real Triki is connected.", pady=(6, 0))
 
@@ -635,6 +635,17 @@ class App(ctk.CTk):
         self._label(cap.body, "Calibrate with the cap lying still. If the 3D cap shows the wrong side up, "
                               "flip 'Sensor is upside down'. Zero pose makes the current position count "
                               "as 'face up' until the next calibration and resets yaw drift.", pady=(4, 0))
+
+        perf = Card(root, "\uE9D9", "Performance", F, icon_colour=theme.MUTED)
+        perf.pack(fill="x", pady=(0, 12))
+        ctk.CTkSegmentedButton(perf.body, values=list(PERF_MODES), variable=self.perf_mode, height=32,
+                               font=F["button"], command=lambda _v: self._perf_changed(),
+                               fg_color=theme.SURFACE_2, selected_color=theme.SURFACE_3,
+                               selected_hover_color=theme.SURFACE_3, unselected_color=theme.SURFACE_2,
+                               unselected_hover_color=theme.SURFACE_3, text_color=theme.TEXT)\
+            .pack(fill="x", pady=(2, 6))
+        self.perf_hint = self._label(perf.body, "")
+        self._update_perf_hint()
 
         bg = Card(root, Icon.POWER, "Background", F, icon_colour=theme.GOOD)
         bg.pack(fill="x", pady=(0, 12))
@@ -1030,6 +1041,7 @@ class App(ctk.CTk):
                 self._flash(f"Tap  ({e.value:.2f} g)")
             elif e.name == "flip":
                 self._switch_output(e.value)
+                self._gesture("flip_" + e.value)
         if (turned or abs(self.key_accum) >= 2) and self.live and self.vol_enabled.get():
             self._change_volume(turned)
         if app_turned and self.live:
@@ -1091,30 +1103,27 @@ class App(ctk.CTk):
     def _flash(self, text, seconds=1.2):
         self.flash_text, self.flash_until = text, time.time() + seconds
 
-    def _action_id(self, gesture):
-        return LABEL_TO_ID.get(self.action_vars[gesture].get(), "none")
-
     def _gesture(self, name):
         if name in BUTTON_GESTURES or name == "single_click":
             if self._ptt or self._held_twisted:     # the button is busy with talk / app volume
                 return
         if name in ("click", "single_click"):
             # With a double-click action set, a click must wait to see whether a second one follows.
-            wait = self._action_id("double_click") != "none"
+            wait = bool(self._steps("double_click"))
             if (name == "single_click") != wait:
                 return
             name = "click"
         if name == "double_tap":
             self._flash("Double tap!", 1.5)
-        aid = self._action_id(name)
-        if aid == "none":
+        steps = self._steps(name)
+        if not steps:
             return
-        label = ACTIONS[aid][0]
         if not self.live:
             if self.simulated:
-                self.set_status(f"Demo: {GESTURES[name].lower()} would run '{label}'")
+                labels = " + ".join(ACTIONS[st["action"]][0] for st in steps)
+                self.set_status(f"Demo: {GESTURES[name].lower()} would run '{labels}'")
             return
-        self._run_action(aid, self.action_args[name].get())
+        self._run_chain(steps)
 
     def _run_action(self, aid, arg=""):
         label, icon, _needs_arg = ACTIONS[aid]
@@ -1134,6 +1143,17 @@ class App(ctk.CTk):
             if aid == "mute":
                 actions.tap_key(actions.VK["volumemute"])   # Windows shows its own overlay
                 return
+            if aid in ("mute_mic", "unmute_mic"):
+                self._set_mic(aid == "mute_mic")
+                label = "Microphone muted" if aid == "mute_mic" else "Microphone on"
+            elif aid in ("mute_speakers", "unmute_speakers"):
+                self.audio._volume_iface().SetMute(aid == "mute_speakers", None)
+                label = "Speakers muted" if aid == "mute_speakers" else "Speakers on"
+            elif aid == "set_volume":
+                pct = max(0.0, min(100.0, float(str(arg).strip().rstrip("%").replace(",", "."))))
+                self.vol_level = self.audio.set_volume(pct / 100)
+                self.vol_read_at = time.time()
+                label = f"Volume {pct:.0f}%"
             elif aid == "shortcut":
                 actions.send_shortcut(arg)
                 label = arg.strip() or label
@@ -1200,16 +1220,13 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------- profiles
     def _profile_snapshot(self):
-        return {"actions": {g: {"action": self._action_id(g), "arg": self.action_args[g].get()} for g in GESTURES},
+        return {"actions": {g: [dict(st) for st in self.chains[g]] for g in GESTURES},
                 "mic_mode": self.mic_mode.get(), "app_twist": bool(self.app_twist.get()),
                 "dev_ids": dict(self.dev_ids), "dev_names": dict(self.dev_names)}
 
     def _apply_profile_vars(self, prof):
         for g in GESTURES:
-            spec = (prof.get("actions") or {}).get(g, {"action": DEFAULTS[g], "arg": DEFAULT_ARGS.get(g, "")})
-            aid = spec.get("action") if spec.get("action") in ACTIONS else DEFAULTS[g]
-            self.action_vars[g].set(ACTIONS[aid][0])
-            self.action_args[g].set(spec.get("arg", ""))
+            self.chains[g] = self._clean_chain((prof.get("actions") or {}).get(g), g)
         if prof.get("mic_mode") in MIC_MODES:
             self.mic_mode.set(prof["mic_mode"])
         self.app_twist.set(bool(prof.get("app_twist", True)))
@@ -1219,7 +1236,7 @@ class App(ctk.CTk):
     def _refresh_profile_ui(self):
         self.profile_menu.configure(values=list(self.profiles))
         for g in GESTURES:
-            self._action_changed(g, save=False)
+            self._render_chain(g)
         self._update_mic_hint()
         if self.audio:
             self.refresh_audio_devices()
@@ -1304,16 +1321,92 @@ class App(ctk.CTk):
         if self.notify.get():
             self.toast.show(Icon.SPEAKERS, name, "Output device", theme.INFO)
 
-    def _action_changed(self, gesture, save=True):
-        box = self.arg_entries[gesture]
-        aid = self._action_id(gesture)
-        if ACTIONS[aid][2]:
-            box.hint.configure(text=ARG_HINTS[aid])
-            box.pack(fill="x", pady=(6, 0))
-        else:
-            box.pack_forget()
-        if save:
-            self.save_config()
+    # ------------------------------------------------------------- action chains
+    def _steps(self, gesture):
+        """The chain's real steps (no 'Do nothing')."""
+        return [st for st in self.chains[gesture] if st.get("action", "none") != "none"]
+
+    def _render_chain(self, g):
+        """(Re)build the editor for one gesture's chain."""
+        box = self.chain_boxes[g]
+        for w in box.winfo_children():
+            w.destroy()
+        F = self.fonts
+        labels = [label for label, _i, _a in ACTIONS.values()]
+        chain = self.chains[g]
+        for i, step in enumerate(chain):
+            line = ctk.CTkFrame(box, fg_color="transparent")
+            line.pack(fill="x", pady=(6, 0))
+            top = ctk.CTkFrame(line, fg_color="transparent")
+            top.pack(fill="x")
+            if len(chain) > 1:
+                ctk.CTkLabel(top, text=f"{i + 1}.", font=F["small"], text_color=theme.FAINT, width=18)\
+                    .pack(side="left")
+            var = tk.StringVar(self, value=ACTIONS.get(step["action"], ACTIONS["none"])[0])
+            menu = self._option(top, var, labels, width=240,
+                                command=lambda v, g=g, i=i: self._set_step(g, i, LABEL_TO_ID.get(v, "none")))
+            menu._triki_var = var
+            menu.pack(side="left", fill="x", expand=True)
+            if len(chain) > 1:
+                ctk.CTkButton(top, text="\u2715", width=30, height=30, corner_radius=8, font=F["small"],
+                              fg_color="transparent", hover_color=theme.SURFACE_3, text_color=theme.MUTED,
+                              command=lambda g=g, i=i: self._remove_step(g, i)).pack(side="left", padx=(6, 0))
+            aid = step["action"] if step["action"] in ACTIONS else "none"
+            if ACTIONS[aid][2]:
+                arg = tk.StringVar(self, value=step.get("arg", ""))
+                arg.trace_add("write", lambda *_a, st=step, v=arg: st.__setitem__("arg", v.get()))
+                entry = ctk.CTkEntry(line, textvariable=arg, height=30, corner_radius=8, fg_color=theme.BG,
+                                     border_color=theme.BORDER, text_color=theme.TEXT, font=F["body"])
+                entry._triki_var = arg
+                entry.pack(fill="x", pady=(4, 0), padx=(22 if len(chain) > 1 else 0, 0))
+                entry.bind("<FocusOut>", lambda _e: self.save_config())
+                ctk.CTkLabel(line, text=ARG_HINTS.get(aid, ""), font=F["small"], text_color=theme.FAINT,
+                             anchor="w").pack(fill="x", padx=(22 if len(chain) > 1 else 0, 0))
+        if len(chain) < MAX_STEPS and self._steps(g):
+            ctk.CTkButton(box, text="+ Add action", height=26, width=110, corner_radius=8, font=F["small"],
+                          fg_color="transparent", hover_color=theme.SURFACE_3, text_color=theme.ACCENT,
+                          anchor="w", command=lambda g=g: self._add_step(g)).pack(anchor="w", pady=(6, 0))
+
+    def _set_step(self, g, i, aid):
+        step = self.chains[g][i]
+        step["action"] = aid
+        if not ACTIONS[aid][2]:
+            step["arg"] = ""
+        self._render_chain(g)
+        self.save_config()
+
+    def _add_step(self, g):
+        self.chains[g].append({"action": "none", "arg": ""})
+        self._render_chain(g)
+
+    def _remove_step(self, g, i):
+        del self.chains[g][i]
+        if not self.chains[g]:
+            self.chains[g] = [{"action": "none", "arg": ""}]
+        self._render_chain(g)
+        self.save_config()
+
+    def _run_chain(self, steps, i=0):
+        """Run steps one after another; 'Wait' pauses without blocking the window."""
+        while i < len(steps):
+            step = steps[i]
+            i += 1
+            if step["action"] == "wait":
+                try:
+                    delay = max(0.0, min(30.0, float(str(step.get("arg", "")).replace(",", "."))))
+                except ValueError:
+                    delay = 0.5
+                self.after(int(delay * 1000), lambda: self._run_chain(steps, i))
+                return
+            self._run_action(step["action"], step.get("arg", ""))
+
+    @staticmethod
+    def _clean_chain(value, gesture):
+        """Settings -> chain; accepts the old single {"action", "arg"} format too."""
+        items = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+        chain = [{"action": it.get("action"), "arg": str(it.get("arg", ""))}
+                 for it in items if isinstance(it, dict) and it.get("action") in ACTIONS][:MAX_STEPS]
+        return chain or [{"action": DEFAULTS[gesture], "arg": DEFAULT_ARGS.get(gesture, "")}]
 
     def _audio_tick(self, now):
         if self.audio is None:
@@ -1370,7 +1463,7 @@ class App(ctk.CTk):
         self._update_chrome(now)
         if self.state() not in ("withdrawn", "iconic"):   # also when maximised ("zoomed")
             self._render(st)
-        self.after(33, self._tick)
+        self.after(PERF.get(self.perf_mode.get(), PERF["Smooth"])[2], self._tick)
 
     def _conn_display(self, now):
         s = self.conn_state
@@ -1487,10 +1580,15 @@ class App(ctk.CTk):
             widget.configure(**changed)
 
     def _render(self, st):
+        quality, every, _ms = PERF.get(self.perf_mode.get(), PERF["Smooth"])
+        self._tick_no += 1
+        if self._tick_no % every:
+            return                       # lighter modes redraw less often
         mic_glow = None
         if self.conn_state == "live" and self.mic_muted is not None:
             mic_glow = theme.BAD if self.mic_muted else None
-        self.view.render(st.quaternion, st.button, glow=mic_glow)
+        if quality:
+            self.view.render(st.quaternion, st.button, glow=mic_glow)
 
         face = {"up": "Face up", "down": "Face down", None: "On edge"}[st.face] if self.cap else "-"
         self.chip_face.set(face)
@@ -1530,6 +1628,31 @@ class App(ctk.CTk):
             hist = list(self.history)
             self.gyro_scope.render([h[0] for h in hist], st.gyro_dps)
             self.acc_scope.render([h[1] for h in hist], st.accel_g)
+
+    # ------------------------------------------------------------- performance
+    def _perf_changed(self, save=True):
+        quality = PERF.get(self.perf_mode.get(), PERF["Smooth"])[0]
+        if quality:
+            self.view.quality = quality
+            self.view_off.pack_forget()
+            if not self.view.winfo_manager():
+                self.view.pack(fill="both", expand=True, padx=12, pady=(12, 0), before=self.chips_frame)
+        else:
+            self.view.pack_forget()
+            if not self.view_off.winfo_manager():
+                self.view_off.pack(fill="both", expand=True, padx=12, pady=(12, 0), before=self.chips_frame)
+        self._update_perf_hint()
+        if save:
+            self.save_config()
+
+    def _update_perf_hint(self):
+        if hasattr(self, "perf_hint"):
+            self.perf_hint.configure(text={
+                "Smooth": "Full-detail 3D cap at up to 30 frames per second.",
+                "Light": "Simpler 3D cap, about 10 frames per second - for older or low-power laptops.",
+                "Minimal": "No 3D view, slower screen updates - the lightest. Gestures and audio "
+                           "work exactly the same in every mode.",
+            }.get(self.perf_mode.get(), ""))
 
     # ------------------------------------------------------------- window / tray
     def show_window(self):
@@ -1580,14 +1703,13 @@ class App(ctk.CTk):
     CONFIG_KEYS = ("layout", "gyro_scale", "odr", "kp", "invert_gyro", "vol_enabled", "vol_deg_per_100",
                    "knob_deadzone", "vol_invert", "vol_osd", "switch_enabled", "switch_hold",
                    "tap_threshold", "double_tap_window", "shake_force",
-                   "auto_connect", "close_to_tray", "notify", "mic_badge", "upside_down")
+                   "auto_connect", "close_to_tray", "notify", "mic_badge", "upside_down", "perf_mode")
 
     def save_config(self):
         try:
             data = {k: getattr(self, k).get() for k in self.CONFIG_KEYS}
             data["calibration"] = self.calib_snapshot
-            data["actions"] = {g: {"action": self._action_id(g), "arg": self.action_args[g].get()}
-                               for g in GESTURES}
+            data["actions"] = {g: [dict(st) for st in self.chains[g]] for g in GESTURES}
             self.profiles[self._current_profile] = self._profile_snapshot()
             data["profiles"] = self.profiles
             data["profile"] = self._current_profile
@@ -1622,9 +1744,8 @@ class App(ctk.CTk):
         if saved is None and data.get("mic_enabled") is False:   # settings from before Actions existed
             saved = {"click": {"action": "none"}}
         for g, spec in (saved or {}).items():
-            if g in GESTURES and spec.get("action") in ACTIONS:
-                self.action_vars[g].set(ACTIONS[spec["action"]][0])
-                self.action_args[g].set(spec.get("arg", ""))
+            if g in GESTURES:
+                self.chains[g] = self._clean_chain(spec, g)
         pos = data.get("badge_pos")
         self.badge_pos = tuple(pos) if isinstance(pos, list) and len(pos) == 2 else None
         profiles = data.get("profiles")

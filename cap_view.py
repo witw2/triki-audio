@@ -1,7 +1,9 @@
-"""3D bottle-cap renderer and a small strip chart, drawn on plain tkinter canvases."""
+"""3D bottle-cap renderer (Pillow image on a canvas) and a small strip chart."""
 
 import math
 import tkinter as tk
+
+from PIL import Image, ImageDraw, ImageTk
 
 from triki.orientation import cross, dot, mat_vec, q_to_matrix
 
@@ -20,6 +22,10 @@ def _hex(rgb):
 def _rgb(hex_colour):
     h = hex_colour.lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _int(rgb):
+    return tuple(max(0, min(255, int(c))) for c in rgb)
 
 
 def _mix(a, b, t):
@@ -86,6 +92,8 @@ def _poly_normal(pts):
 
 
 class CapView(tk.Canvas):
+    """3D cap, drawn with Pillow into one image per frame (about 4x faster than canvas shapes)."""
+
     COLORS = {
         "top": (222, 178, 62),
         "skirt": (204, 160, 50),
@@ -97,7 +105,13 @@ class CapView(tk.Canvas):
     def __init__(self, master, bg=theme.SURFACE, **kw):
         super().__init__(master, background=bg, highlightthickness=0, **kw)
         self.bg = _rgb(bg)
-        self.faces = build_cap_mesh()
+        self._meshes = {"high": build_cap_mesh(sub=4), "low": build_cap_mesh(sub=2)}
+        self.quality = "high"          # "low" = half the polygons, plain background (slow PCs)
+        self._bg_key = None            # background is redrawn only when the camera / size changes
+        self._fg_key = None            # the cap is redrawn only when it moved
+        self._bg_img = None
+        self._photo = None
+        self._img_item = None
         self.az = math.radians(-60)
         self.el = math.radians(26)
         self.zoom = 1.0
@@ -107,6 +121,10 @@ class CapView(tk.Canvas):
         self.bind("<B1-Motion>", self._motion)
         self.bind("<MouseWheel>", self._wheel)
         self.bind("<Double-Button-1>", lambda e: self.reset_camera())
+
+    @property
+    def faces(self):
+        return self._meshes[self.quality]
 
     def reset_camera(self):
         self.az, self.el, self.zoom = math.radians(-60), math.radians(26), 1.0
@@ -131,11 +149,15 @@ class CapView(tk.Canvas):
         return back, right, cross(back, right)
 
     def render(self, q, pressed=False, glow=None):
-        """glow: optional hex colour for a soft halo (e.g. mic state)."""
-        self.delete("all")
+        """glow: optional hex colour for a soft halo (e.g. mic state). Returns True if it drew."""
         w, h = self.winfo_width(), self.winfo_height()
         if w < 20 or h < 20:
-            return
+            return False
+        cam = (w, h, round(self.az, 4), round(self.el, 4), round(self.zoom, 4), self.quality, glow, self.show_axes)
+        fg_key = (cam, tuple(round(c, 3) for c in q), bool(pressed))
+        if fg_key == self._fg_key:
+            return False                      # nothing moved: keep the current picture
+        self._fg_key = fg_key
         cx, cy = w / 2, h / 2 + h * 0.04
         s = min(w, h) * 0.27 * self.zoom
         back, right, up = self._camera()
@@ -146,30 +168,47 @@ class CapView(tk.Canvas):
             k = dist / (dist - d)
             return cx + s * dot(p, right) * k, cy - s * dot(p, up) * k, d
 
-        # soft radial halo
+        if cam != self._bg_key:
+            self._bg_key = cam
+            self._bg_img = self._draw_background(w, h, cx, cy, s, proj, glow)
+            self.delete("all")
+            self._photo = ImageTk.PhotoImage(self._bg_img)
+            self._img_item = self.create_image(0, 0, image=self._photo, anchor="nw")
+            self.create_text(14, h - 12, anchor="sw", fill=theme.FAINT, font=(theme.FONT, 9),
+                             text="drag to orbit  ·  scroll to zoom  ·  double-click to reset")
+        img = self._bg_img.copy()
+        self._draw_cap(ImageDraw.Draw(img), q, pressed, back, right, up, proj)
+        self._photo.paste(img)
+        return True
+
+    def _draw_background(self, w, h, cx, cy, s, proj, glow):
+        low = self.quality == "low"
+        img = Image.new("RGB", (w, h), self.bg)
+        d = ImageDraw.Draw(img)
         halo = _rgb(glow) if glow else (60, 66, 80)
-        for i in range(10, 0, -1):
+        for i in range(10, 0, -1 if not low else -3):     # soft radial halo
             r = s * (0.9 + i * 0.16)
             col = _mix(self.bg, halo, 0.13 * (1 - i / 10) ** 1.6)
-            self.create_oval(cx - r, cy - r * 0.92, cx + r, cy + r * 0.92, fill=_hex(col), outline="")
-
-        # floor: dotted grid + contact shadow
+            d.ellipse((cx - r, cy - r * 0.92, cx + r, cy + r * 0.92), fill=_int(col))
         fz = -0.95
-        dot_col = _hex(_mix(self.bg, (255, 255, 255), 0.09))
-        for i in range(-4, 5):
-            for j in range(-4, 5):
-                if i * i + j * j > 18:
-                    continue
-                x, y, _ = proj((i * 0.45, j * 0.45, fz))
-                self.create_oval(x - 1.2, y - 1.2, x + 1.2, y + 1.2, fill=dot_col, outline="")
-        for k, a in ((1.05, 0.12), (0.85, 0.2), (0.62, 0.28)):
+        if not low:                                         # dotted floor
+            dot_col = _int(_mix(self.bg, (255, 255, 255), 0.09))
+            for i in range(-4, 5):
+                for j in range(-4, 5):
+                    if i * i + j * j > 18:
+                        continue
+                    x, y, _ = proj((i * 0.45, j * 0.45, fz))
+                    d.ellipse((x - 1.2, y - 1.2, x + 1.2, y + 1.2), fill=dot_col)
+        for k, a in ((1.05, 0.12), (0.85, 0.2), (0.62, 0.28)):   # contact shadow
             pts = []
-            for i in range(32):
-                th = 2 * math.pi * i / 32
+            for i in range(48):
+                th = 2 * math.pi * i / 48
                 x, y, _ = proj((k * math.cos(th), k * math.sin(th), fz))
-                pts += [x, y]
-            self.create_polygon(pts, fill=_hex(_mix(self.bg, (0, 0, 0), a)), outline="", smooth=True)
+                pts.append((x, y))
+            d.polygon(pts, fill=_int(_mix(self.bg, (0, 0, 0), a)))
+        return img
 
+    def _draw_cap(self, d, q, pressed, back, right, up, proj):
         rot = q_to_matrix(q)
         light = v_norm(tuple(1.0 * b + 0.7 * u - 0.45 * r for b, r, u in zip(back, right, up)))
         polys = []
@@ -191,27 +230,23 @@ class CapView(tk.Canvas):
             refl = v_norm(tuple(2 * dot(n, light) * nc - lc for nc, lc in zip(n, light)))
             spec = max(0.0, dot(refl, back)) ** 22 * 0.75
             shade = 0.24 + 0.76 * diff
-            col = _hex(tuple(c * shade + 255 * spec for c in base))
-            polys.append((depth, [c for p in pp for c in p[:2]], col, kind))
+            col = _int(tuple(c * shade + 255 * spec for c in base))
+            polys.append((depth, [(p[0], p[1]) for p in pp], col, kind))
         # The logo is printed on the top face, so draw it right after the nearest top polygon
         # (per-polygon depth sorting would let top triangles cover parts of it).
-        top_depths = [d for d, _, _, k in polys if k == "top"]
+        top_depths = [dd for dd, _, _, k in polys if k == "top"]
         if top_depths:
             logo_depth = max(top_depths) + 1e-6
-            polys = [(logo_depth, c, col, k) if k in ("icon", "icon_in") else (d, c, col, k)
-                     for d, c, col, k in polys]
+            polys = [(logo_depth, c, col, k) if k in ("icon", "icon_in") else (dd, c, col, k)
+                     for dd, c, col, k in polys]
         polys.sort(key=lambda t: t[0])
-        for _, coords, col, _kind in polys:
-            self.create_polygon(coords, fill=col, outline=col)
-
+        for _, xy, col, _kind in polys:
+            d.polygon(xy, fill=col, outline=col)
         if self.show_axes:
             c0 = proj((0, 0, 0))
             for vec, col in zip(((1.5, 0, 0), (0, 1.5, 0), (0, 0, 1.0)), theme.AXIS_COLORS):
                 p = proj(mat_vec(rot, vec))
-                self.create_line(c0[0], c0[1], p[0], p[1], fill=col, width=1, dash=(3, 3))
-
-        self.create_text(14, h - 12, anchor="sw", fill=theme.FAINT, font=(theme.FONT, 9),
-                         text="drag to orbit  ·  scroll to zoom  ·  double-click to reset")
+                d.line((c0[0], c0[1], p[0], p[1]), fill=col, width=1)
 
 
 class Scope(tk.Canvas):

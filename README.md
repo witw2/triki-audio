@@ -15,9 +15,11 @@ Turn the **Triki** bottle-cap controller into a desk audio remote for Windows.
 | **double-tap the table** next to it | previous track |
 | **shake** it (firmly) | open Spotify in the browser |
 
-Every click, tap and shake can be set to: mute the mic, play/pause,
-next / previous track, shuffle, mute the speakers, switch output device,
-switch profile, **any keyboard shortcut**, or **open an app or website**.
+Every click, tap, shake and **flip (face up / face down)** can run a **chain of
+actions**, e.g. *turn it face down -> mute the mic, wait 0.5 s, press ctrl+alt+m*.
+Actions: mute / unmute the mic, play/pause, next / previous track, shuffle,
+mute / unmute the speakers, set the volume, switch output device, switch profile,
+**any keyboard shortcut**, **open an app or website**, and wait.
 
 Also:
 
@@ -82,6 +84,10 @@ No cap at hand? **Device → Try demo** simulates one (your audio is left alone)
 * **Table taps too sensitive (or not enough)?** Actions → *Table taps* has a
   live meter: knock a few times and set *Knock needed* just below your knocks.
 * **Pop-ups / muted badge:** Controls → *Notifications*.
+* **Use flips for actions only:** turn off the *Output device* switch on the
+  Controls tab, then set *Turn it face up / down* on the Actions tab.
+* **Slow laptop?** Device → *Performance*: **Light** (simpler 3D, ~10 fps) or
+  **Minimal** (no 3D view). Gestures and audio work the same in every mode.
 
 Settings are stored in `%APPDATA%\TrikiAudio\config.json`.
 

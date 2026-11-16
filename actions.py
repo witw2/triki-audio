@@ -14,11 +14,17 @@ ACTIONS = {
     "next": ("Next track", "\uE893", False),
     "prev": ("Previous track", "\uE892", False),
     "mute": ("Mute / unmute speakers", "\uE74F", False),
+    "mute_mic": ("Mute microphone", Icon.MIC_OFF, False),
+    "unmute_mic": ("Unmute microphone", Icon.MIC, False),
+    "mute_speakers": ("Mute speakers", "\uE74F", False),
+    "unmute_speakers": ("Unmute speakers", Icon.VOLUME, False),
+    "set_volume": ("Set volume to...", Icon.VOLUME, True),
     "output_cycle": ("Switch output device", Icon.SPEAKERS, False),
     "shuffle": ("Toggle shuffle", "", False),
     "next_profile": ("Next profile", "", False),
     "shortcut": ("Keyboard shortcut...", "\uE765", True),
     "open": ("Open app or website...", "\uE8A7", True),
+    "wait": ("Wait...", "\uE916", True),
 }
 LABEL_TO_ID = {label: key for key, (label, _icon, _arg) in ACTIONS.items()}
 
@@ -29,13 +35,18 @@ GESTURES = {
     "long_press": "Hold the button",
     "double_tap": "Double-tap the table",
     "shake": "Shake",
+    "flip_up": "Turn it face up",
+    "flip_down": "Turn it face down",
 }
 BUTTON_GESTURES = ("click", "double_click", "long_press")
 DEFAULTS = {"click": "play_pause", "double_click": "next", "long_press": "mic", "double_tap": "prev",
-            "shake": "open"}
+            "shake": "open", "flip_up": "none", "flip_down": "none"}
 DEFAULT_ARGS = {"shake": "https://open.spotify.com/"}
+MAX_STEPS = 6   # actions per gesture
 
 ARG_HINTS = {
+    "set_volume": "volume in %, e.g. 20",
+    "wait": "seconds, e.g. 0.5 - then the next action runs",
     "shortcut": "e.g. ctrl+shift+m  or  win+d",
     "open": r"e.g. https://open.spotify.com  or  C:\path\app.exe",
 }
