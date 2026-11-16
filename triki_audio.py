@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -34,6 +35,11 @@ except ImportError:  # not installed: use the copy next to this project
     import triki
 from triki.orientation import dot
 
+MIN_TRIKI = (0, 5, 0)   # tilt, shake and battery
+if tuple(int(x) for x in triki.__version__.split(".")[:3]) < MIN_TRIKI:
+    raise SystemExit(f"Triki Audio needs triki {'.'.join(map(str, MIN_TRIKI))} or newer "
+                     f"(found {triki.__version__}). Run: pip install -U -r requirements.txt")
+
 try:
     from triki.contrib.winaudio import AudioController
     AUDIO_IMPORT_ERROR = ""
@@ -44,17 +50,25 @@ except Exception as _err:  # comtypes missing / not Windows
 import actions
 import system
 import theme
-from actions import ACTIONS, ARG_HINTS, DEFAULTS, GESTURES, LABEL_TO_ID
+from actions import ACTIONS, ARG_HINTS, BUTTON_GESTURES, DEFAULTS, GESTURES, LABEL_TO_ID
+import media
 from cap_view import CapView, Scope
 from overlay import MutedBadge, Toast
 from theme import Icon
 from tray import Tray, cap_image
 
 HERE = Path(__file__).resolve().parent
-CONFIG_FILE = HERE / "triki_audio_config.json"
-OLD_CONFIG_FILE = HERE / "triki_cap_config.json"
-ICON_FILE = HERE / "triki_audio.ico"
+# Settings live in %APPDATA%\TrikiAudio (works the same for the script and the packaged .exe).
+DATA_DIR = Path(os.environ.get("APPDATA") or Path.home()) / "TrikiAudio"
+CONFIG_FILE = DATA_DIR / "config.json"
+OLD_CONFIG_FILE = HERE / "triki_audio_config.json"     # where older versions kept it (copied over once)
+ICON_FILE = DATA_DIR / "triki_audio.ico"
 NO_DEVICE = "Don't switch"
+MIC_MODES = ("Click to toggle", "Hold to talk")
+# library events the app reacts to (tilt_left etc. are app-side names for the 'tilt' event)
+TRIKI_EVENTS = ("calibrated", "twist", "flip", "tap", "double_tap", "tilt", "shake", "press", "release",
+                "click", "single_click", "double_click", "long_press", "battery")
+LOW_BATTERY = 15
 LAYOUTS = {"Auto": "auto", "ABC=gyro, DEF=accel": "gyro_first", "ABC=accel, DEF=gyro": "accel_first"}
 RETRY_S = 1.5          # pause between connection attempts (each attempt itself waits ~10 s)
 QUIET_S = 4.0          # no data for this long while connected = the cap went to sleep
@@ -102,7 +116,8 @@ class Chip(ctk.CTkFrame):
 
 # ============================================================== app
 class App(ctk.CTk):
-    def __init__(self, start_hidden=False):
+    def __init__(self, start_hidden=False, selftest=False):
+        self.selftest = selftest
         ctk.set_appearance_mode("dark")
         super().__init__(fg_color=theme.BG)
         system.set_app_id()
@@ -144,6 +159,21 @@ class App(ctk.CTk):
         self.action_vars = {g: V(tk.StringVar, ACTIONS[DEFAULTS[g]][0]) for g in GESTURES}
         self.action_args = {g: V(tk.StringVar, "") for g in GESTURES}
         self._impact_hold = 0.0        # strongest knock since the last screen update (triki thread)
+        self.mic_mode = V(tk.StringVar, MIC_MODES[0])
+        self.app_twist = V(tk.BooleanVar, True)       # hold the button + twist = volume of the playing app
+        self.profile_name = V(tk.StringVar, "Default")
+        self.profiles = {}                            # name -> settings snapshot
+        self._current_profile = "Default"
+        self.game_best = {}
+        self.battery = None
+        self._low_warned = False
+        self._held_target = None                      # app whose volume this press is changing
+        self._held_twisted = False                    # this press was used for app volume: no click
+        self._app_level = None
+        self.now_playing = None
+        self._media_toast_until = 0.0
+        self.game = None
+        self.media = media.MediaWatcher(lambda np: self.call_soon(lambda np=np: self._now_playing_changed(np)))
         self.impact_peak = 0.0
         self.flash_text, self.flash_until = "", 0.0
         self.dev_up = V(tk.StringVar, NO_DEVICE)
@@ -197,7 +227,9 @@ class App(ctk.CTk):
         self.toast = Toast(self)
         self.badge = MutedBadge(self, on_moved=self._badge_moved)
         self.badge.pos = self.badge_pos
-        self.tray.start()
+        if not selftest:
+            self.tray.start()
+        self.media.start()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         if start_hidden and self.tray.available:
@@ -209,9 +241,11 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ layout
     def _set_icon(self):
         try:
+            ICON_FILE.parent.mkdir(parents=True, exist_ok=True)
             if not ICON_FILE.exists():
                 cap_image(256).save(ICON_FILE, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
             self.iconbitmap(str(ICON_FILE))
+            self.icon_path = str(ICON_FILE)
         except Exception:
             pass
 
@@ -236,6 +270,9 @@ class App(ctk.CTk):
                                       fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
                                       text_color=theme.ACCENT_TEXT)
         self.conn_btn.pack(side="right")
+        ctk.CTkButton(head, text="", width=38, height=38, corner_radius=19, font=F["icon"],
+                      fg_color=theme.SURFACE, hover_color=theme.SURFACE_3, text_color=theme.TEXT,
+                      border_width=1, border_color=theme.BORDER, command=self.open_game)            .pack(side="right", padx=(0, 10))
         pill = ctk.CTkFrame(head, fg_color=theme.SURFACE, corner_radius=19, height=38,
                             border_width=1, border_color=theme.BORDER)
         pill.pack(side="right", padx=(0, 10))
@@ -243,6 +280,8 @@ class App(ctk.CTk):
         self.pill_dot.pack(side="left", padx=(14, 6), pady=6)
         self.pill_text = ctk.CTkLabel(pill, text="Not connected", font=F["body"], text_color=theme.TEXT)
         self.pill_text.pack(side="left", padx=(0, 16), pady=6)
+        self.pill_batt = ctk.CTkLabel(pill, text="", font=F["small"], text_color=theme.MUTED)
+        self.pill_batt_icon = ctk.CTkLabel(pill, text="", font=F["icon"], text_color=theme.MUTED, width=18)
 
         # ---- body
         body = ctk.CTkFrame(self, fg_color="transparent")
@@ -350,8 +389,37 @@ class App(ctk.CTk):
     # ---- tab: controls
     def _build_controls(self, root):
         F = self.fonts
+        np_card = Card(root, "\uE8D6", "Now playing", F)
+        np_card.pack(fill="x", pady=(4, 12))
+        row = ctk.CTkFrame(np_card.body, fg_color="transparent")
+        row.pack(fill="x")
+        self._np_placeholder = ctk.CTkImage(cap_image(128), size=(64, 64))
+        self.np_art = ctk.CTkLabel(row, text="", image=self._np_placeholder, width=64, height=64)
+        self.np_art.pack(side="left")
+        texts = ctk.CTkFrame(row, fg_color="transparent")
+        texts.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        self.np_title = ctk.CTkLabel(texts, text="Nothing playing", font=F["h2"], text_color=theme.TEXT,
+                                     anchor="w", justify="left", wraplength=230)
+        self.np_title.pack(fill="x")
+        self.np_sub = ctk.CTkLabel(texts, text="Start music or a video in any app", font=F["small"],
+                                   text_color=theme.MUTED, anchor="w", justify="left", wraplength=230)
+        self.np_sub.pack(fill="x")
+        btns = ctk.CTkFrame(np_card.body, fg_color="transparent")
+        btns.pack(pady=(10, 0))
+        self.np_buttons = {}
+        for key, glyph in (("prev", "\uE892"), ("play_pause", "\uE768"), ("next", "\uE893"), ("shuffle", "\uE8B1")):
+            b = ctk.CTkButton(btns, text=glyph, width=52 if key == "play_pause" else 42,
+                              height=52 if key == "play_pause" else 42,
+                              corner_radius=26 if key == "play_pause" else 21, font=F["icon_big"],
+                              fg_color=theme.ACCENT if key == "play_pause" else theme.SURFACE_2,
+                              hover_color=theme.ACCENT_HOVER if key == "play_pause" else theme.SURFACE_3,
+                              text_color=theme.ACCENT_TEXT if key == "play_pause" else theme.TEXT,
+                              command=lambda k=key: self._media_command(k))
+            b.pack(side="left", padx=6)
+            self.np_buttons[key] = b
+
         vol = Card(root, Icon.VOLUME, "Volume", F)
-        vol.pack(fill="x", pady=(4, 12))
+        vol.pack(fill="x", pady=(0, 12))
         vol.head_switch(self.vol_enabled)
         row = ctk.CTkFrame(vol.body, fg_color="transparent")
         row.pack(fill="x")
@@ -367,14 +435,23 @@ class App(ctk.CTk):
                          lambda v: f"{v:.0f}° for 0-100%", steps=33)
         self._switch_row(vol.body, "Windows volume overlay", self.vol_osd)
         self._switch_row(vol.body, "Reverse direction", self.vol_invert)
+        self._switch_row(vol.body, "Hold button + twist = app volume", self.app_twist)
+        self._label(vol.body, "Hold the cap's button while twisting to change only the app that is "
+                              "playing (e.g. Spotify), not the whole PC.", pady=(2, 0))
 
         mic = Card(root, Icon.MIC, "Microphone", F)
         mic.pack(fill="x", pady=(0, 12))
+        ctk.CTkSegmentedButton(mic.body, values=list(MIC_MODES), variable=self.mic_mode, height=32,
+                               font=F["button"], command=lambda _v: self._mic_mode_changed(),
+                               fg_color=theme.SURFACE_2, selected_color=theme.SURFACE_3,
+                               selected_hover_color=theme.SURFACE_3, unselected_color=theme.SURFACE_2,
+                               unselected_hover_color=theme.SURFACE_3, text_color=theme.TEXT)\
+            .pack(fill="x", pady=(2, 8))
         self.mic_btn = ctk.CTkButton(mic.body, text="Microphone", height=46, corner_radius=23,
                                      font=F["button"], command=self.toggle_mic_manual)
         self.mic_btn.pack(fill="x", pady=(2, 8))
-        self._label(mic.body, "Click the cap's button to mute or unmute (change it on the Actions tab). "
-                              "You can also click here.")
+        self.mic_hint = self._label(mic.body, "")
+        self._update_mic_hint()
 
         out = Card(root, Icon.SPEAKERS, "Output device", F)
         out.pack(fill="x", pady=(0, 12))
@@ -407,8 +484,22 @@ class App(ctk.CTk):
     # ---- tab: actions
     def _build_actions(self, root):
         F = self.fonts
+        prof = Card(root, "\uE77B", "Profile", F, icon_colour=theme.INFO)
+        prof.pack(fill="x", pady=(4, 12))
+        self.profile_menu = self._option(prof.body, self.profile_name, list(self.profiles) or ["Default"],
+                                         command=lambda name: self.switch_profile(name), width=300)
+        self.profile_menu.pack(fill="x")
+        pb = ctk.CTkFrame(prof.body, fg_color="transparent")
+        pb.pack(fill="x", pady=(8, 0))
+        self._button(pb, "New", self.new_profile, width=90).pack(side="left")
+        self._button(pb, "Rename", self.rename_profile, width=90).pack(side="left", padx=8)
+        self._button(pb, "Delete", self.delete_profile, width=90).pack(side="left")
+        self._label(prof.body, "A profile keeps its own gestures, microphone mode and output devices - "
+                               "e.g. 'Work' and 'Gaming'. Switch from the tray menu or with a gesture.",
+                    pady=(8, 0))
+
         card = Card(root, "\uE7C9", "Gestures", F)
-        card.pack(fill="x", pady=(4, 12))
+        card.pack(fill="x", pady=(0, 12))
         self.arg_entries = {}
         labels = [label for label, _i, _a in ACTIONS.values()]
         for g, text in GESTURES.items():
@@ -433,6 +524,8 @@ class App(ctk.CTk):
                 box.hint.configure(text=ARG_HINTS[aid])
                 box.pack(fill="x", pady=(6, 0))
         self._label(card.body, "Twist (volume) and flip (output device) are set on the Controls tab. "
+                               "Tilt = tip the cap onto an edge and hold; it repeats while held. "
+                               "Button gestures are off while the mic is in 'Hold to talk' mode. "
                                "Actions only run while a real Triki is connected.", pady=(6, 0))
 
         taps = Card(root, "\uE945", "Table taps", F, icon_colour=theme.INFO)
@@ -484,6 +577,7 @@ class App(ctk.CTk):
         self._button(btns, "Try demo", self.demo, width=110).pack(side="right")
         self._switch_row(cap.body, "Connect automatically", self.auto_connect)
         self._switch_row(cap.body, "Sensor is upside down", self.upside_down)
+        self.dev_info = self._label(cap.body, "Connect to see battery, model and firmware.", pady=(4, 2))
         self._label(cap.body, "Calibrate with the cap lying still. If the 3D cap shows the wrong side up, "
                               "flip 'Sensor is upside down'. Zero pose makes the current position count "
                               "as 'face up' until the next calibration and resets yaw drift.", pady=(4, 0))
@@ -578,7 +672,7 @@ class App(ctk.CTk):
         if not simulate and self._snapshot_fits():
             cap.restore_calibration(self.calib_snapshot)
         cap.on("frame", self._on_frame)
-        for name in ("calibrated", "twist", "flip", "tap", *GESTURES, "single_click"):
+        for name in TRIKI_EVENTS:
             cap.on(name, self.inbox.append)   # handled on the Tk thread
         self.attempt = (attempt_id, cap)
 
@@ -606,6 +700,8 @@ class App(ctk.CTk):
             return
         self.attempt = None
         self.cap = cap
+        self.battery = cap.battery
+        self._update_device_info()
         self.history.clear()
         self.failed_attempts = 0
         was_asleep, self.asleep = self.asleep, False
@@ -841,7 +937,7 @@ class App(ctk.CTk):
                 self.toast.show(Icon.MIC, "Microphone on", colour=theme.GOOD)
 
     def _handle_events(self):
-        turned = 0.0
+        turned = app_turned = 0.0
         while self.inbox:
             e = self.inbox.popleft()
             if e.name == "calibrated":
@@ -855,8 +951,24 @@ class App(ctk.CTk):
                 else:
                     self.set_status("The cap moved during calibration - press Calibrate to redo it")
                 self._switch_output(e.state.face)   # output follows the cap from the start
+                if self._ptt and self.live:
+                    self._set_mic(True)              # hold to talk: muted until you hold the button
             elif e.name == "twist":
-                turned += e.value
+                if e.state.button and self.app_twist.get():
+                    app_turned += e.value
+                else:
+                    turned += e.value
+            elif e.name == "press":
+                self._held_target, self._held_twisted, self._app_level = None, False, None
+                if self._ptt and self.live:
+                    self._set_mic(False)
+            elif e.name == "release":
+                if self._ptt and self.live:
+                    self._set_mic(True)
+            elif e.name == "battery":
+                self._battery_changed(e.value)
+            elif e.name == "tilt":
+                self._gesture("tilt_" + e.value)
             elif e.name in GESTURES or e.name == "single_click":
                 self._gesture(e.name)
             elif e.name == "tap":
@@ -865,6 +977,54 @@ class App(ctk.CTk):
                 self._switch_output(e.value)
         if (turned or abs(self.key_accum) >= 2) and self.live and self.vol_enabled.get():
             self._change_volume(turned)
+        if app_turned and self.live:
+            self._change_app_volume(app_turned)
+
+    # ------------------------------------------------------------- mic modes / app volume
+    @property
+    def _ptt(self):
+        return self.mic_mode.get() == MIC_MODES[1]
+
+    def _set_mic(self, muted):
+        if self.audio and self.mic_muted is not muted:
+            self.audio.set_mic_muted(muted)
+            self.mic_muted = muted
+
+    def _mic_mode_changed(self):
+        self._update_mic_hint()
+        if self.live:
+            self._set_mic(self._ptt)     # entering hold-to-talk mutes; leaving it keeps it as is
+        self.save_config()
+
+    def _update_mic_hint(self):
+        if not hasattr(self, "mic_hint"):
+            return
+        self.mic_hint.configure(text="Hold the cap's button to talk - you're muted the rest of the time." if self._ptt
+                                else "Click the cap's button to mute or unmute (change it on the Actions "
+                                     "tab). You can also click here.")
+
+    def _change_app_volume(self, degrees):
+        self._held_twisted = True        # this press is for app volume, not a click
+        if self._held_target is None:
+            self._held_target = self.audio.loudest_app()
+            if self._held_target is None:
+                self.set_status("No app is playing sound right now")
+                self._held_target = False
+                return
+            self._app_level = self._held_target.get_volume()
+        if not self._held_target:
+            return
+        step = degrees / max(1.0, float(self.vol_deg_per_100.get()))
+        if self.vol_invert.get():
+            step = -step
+        try:
+            self._app_level = self._held_target.set_volume(self._app_level + step)
+        except Exception:                # the app closed meanwhile
+            self._held_target = False
+            return
+        if self.notify.get():
+            self.toast.show(Icon.VOLUME, f"{self._held_target.name.capitalize()}  {self._app_level * 100:.0f}%",
+                            "App volume", seconds=0.9)
 
     # ------------------------------------------------------------- actions
     def _on_frame(self, e):
@@ -880,6 +1040,11 @@ class App(ctk.CTk):
         return LABEL_TO_ID.get(self.action_vars[gesture].get(), "none")
 
     def _gesture(self, name):
+        if name in BUTTON_GESTURES or name == "single_click":
+            if self._ptt or self._held_twisted:     # the button is busy with talk / app volume
+                return
+        if self.game is not None and name.startswith(("tilt", "shake", "double_tap")):
+            return                                  # the marble game owns tilting right now
         if name in ("click", "single_click"):
             # With a double-click action set, a click must wait to see whether a second one follows.
             wait = self._action_id("double_click") != "none"
@@ -907,13 +1072,16 @@ class App(ctk.CTk):
             if aid == "output_cycle":
                 self._cycle_output()
                 return
-            if aid == "play_pause":
-                actions.tap_key(actions.VK["playpause"])
-            elif aid == "next":
-                actions.tap_key(actions.VK["nexttrack"])
-            elif aid == "prev":
-                actions.tap_key(actions.VK["prevtrack"])
-            elif aid == "mute":
+            if aid in ("play_pause", "next", "prev", "shuffle"):
+                self._media_command(aid)
+                return
+            if aid == "next_profile":
+                self._next_profile()
+                return
+            if aid == "game":
+                self.open_game()
+                return
+            if aid == "mute":
                 actions.tap_key(actions.VK["volumemute"])   # Windows shows its own overlay
                 return
             elif aid == "shortcut":
@@ -926,6 +1094,163 @@ class App(ctk.CTk):
                 self.toast.show(icon, label, seconds=1.0)
         except Exception as ex:
             self.set_status(f"'{label}' failed: {ex}")
+
+    def _media_command(self, key):
+        """Play/pause, next, previous, shuffle - through the playing app's media session,
+        falling back to the keyboard media keys. Runs off the Tk thread."""
+        self._media_toast_until = time.time() + 3.0
+        fn = {"play_pause": self.media.play_pause, "next": self.media.next,
+              "prev": self.media.previous, "shuffle": self.media.toggle_shuffle}[key]
+        vk = {"play_pause": "playpause", "next": "nexttrack", "prev": "prevtrack"}.get(key)
+
+        def work():
+            ok = fn()
+            if not ok and vk:
+                actions.tap_key(actions.VK[vk])
+                if self.now_playing is None and self.notify.get():
+                    label, icon, _ = ACTIONS[key]
+                    self.call_soon(lambda: self.toast.show(icon, label, seconds=1.0))
+            elif not ok:
+                self.set_status("The current player doesn't support shuffle")
+            elif key == "shuffle":
+                self.call_soon(lambda: self._toast_now_playing(force=True))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _now_playing_changed(self, np):
+        before, self.now_playing = self.now_playing, np
+        if np is None:
+            self._set(self.np_title, text="Nothing playing")
+            self._set(self.np_sub, text="Start music or a video in any app")
+            self.np_art.configure(image=self._np_placeholder)
+            self._set(self.np_buttons["play_pause"], text="\uE768")
+            return
+        self._set(self.np_title, text=np.title)
+        self._set(self.np_sub, text=" · ".join(x for x in (np.artist, np.app) if x))
+        self._set(self.np_buttons["play_pause"], text="\uE769" if np.playing else "\uE768")
+        self._set(self.np_buttons["shuffle"], text_color=theme.ACCENT if np.shuffle else theme.TEXT)
+        art_key = (np.key, np.art is None)
+        if getattr(self, "_np_art_key", None) != art_key:
+            self._np_art_key = art_key
+            img = media.art_image(np.art)
+            self._np_pil = img
+            self.np_art.configure(image=ctk.CTkImage(img, size=(64, 64)) if img else self._np_placeholder)
+        if time.time() < self._media_toast_until:   # the change came from us: show what's playing now
+            self._toast_now_playing()
+
+    def _toast_now_playing(self, force=False):
+        np = self.now_playing
+        if np is None or not self.notify.get():
+            return
+        sub = np.artist or np.app
+        if not np.playing:
+            sub = "Paused"
+        if force and np.shuffle is not None:
+            sub = "Shuffle on" if np.shuffle else "Shuffle off"
+        self.toast.show("\uE8D6", np.title, sub, image=getattr(self, "_np_pil", None), seconds=2.0)
+
+    # ------------------------------------------------------------- profiles
+    def _profile_snapshot(self):
+        return {"actions": {g: {"action": self._action_id(g), "arg": self.action_args[g].get()} for g in GESTURES},
+                "mic_mode": self.mic_mode.get(), "app_twist": bool(self.app_twist.get()),
+                "dev_ids": dict(self.dev_ids), "dev_names": dict(self.dev_names)}
+
+    def _apply_profile_vars(self, prof):
+        for g in GESTURES:
+            spec = (prof.get("actions") or {}).get(g, {"action": DEFAULTS[g]})
+            aid = spec.get("action") if spec.get("action") in ACTIONS else DEFAULTS[g]
+            self.action_vars[g].set(ACTIONS[aid][0])
+            self.action_args[g].set(spec.get("arg", ""))
+        if prof.get("mic_mode") in MIC_MODES:
+            self.mic_mode.set(prof["mic_mode"])
+        self.app_twist.set(bool(prof.get("app_twist", True)))
+        self.dev_ids.update({k: v for k, v in (prof.get("dev_ids") or {}).items() if k in self.dev_ids})
+        self.dev_names.update({k: v for k, v in (prof.get("dev_names") or {}).items() if k in self.dev_names})
+
+    def _refresh_profile_ui(self):
+        self.profile_menu.configure(values=list(self.profiles))
+        for g in GESTURES:
+            self._action_changed(g, save=False)
+        self._update_mic_hint()
+        if self.audio:
+            self.refresh_audio_devices()
+        if self.live:
+            self._set_mic(True) if self._ptt else None
+            if self.cap:
+                self._switch_output(self.cap.state.face)
+
+    def switch_profile(self, name, toast=True):
+        if name not in self.profiles:
+            return
+        self.profiles[self._current_profile] = self._profile_snapshot()
+        self._current_profile = name
+        self.profile_name.set(name)
+        self._apply_profile_vars(self.profiles[name])
+        self._refresh_profile_ui()
+        self.save_config()
+        self.set_status(f"Profile: {name}")
+        if toast and self.notify.get():
+            self.toast.show("\uE77B", name, "Profile", theme.INFO)
+
+    def _next_profile(self):
+        names = list(self.profiles)
+        if len(names) > 1:
+            self.switch_profile(names[(names.index(self._current_profile) + 1) % len(names)])
+
+    def _ask(self, title, text, initial=""):
+        dialog = ctk.CTkInputDialog(title=title, text=text, fg_color=theme.SURFACE, button_fg_color=theme.ACCENT,
+                                    button_hover_color=theme.ACCENT_HOVER, button_text_color=theme.ACCENT_TEXT,
+                                    entry_fg_color=theme.SURFACE_2, entry_border_color=theme.BORDER)
+        name = (dialog.get_input() or "").strip()
+        return name
+
+    def new_profile(self):
+        name = self._ask("New profile", "Name for the new profile (it starts as a copy of the current one):")
+        if not name or name in self.profiles:
+            return
+        self.profiles[self._current_profile] = self._profile_snapshot()
+        self.profiles[name] = self._profile_snapshot()
+        self.switch_profile(name)
+
+    def rename_profile(self):
+        old = self._current_profile
+        name = self._ask("Rename profile", f"New name for '{old}':")
+        if not name or name in self.profiles:
+            return
+        self.profiles = {(name if k == old else k): v for k, v in self.profiles.items()}
+        self._current_profile = name
+        self.profile_name.set(name)
+        self.profile_menu.configure(values=list(self.profiles))
+        self.save_config()
+
+    def delete_profile(self):
+        if len(self.profiles) < 2:
+            self.set_status("This is the only profile")
+            return
+        from tkinter import messagebox
+        old = self._current_profile
+        if not messagebox.askyesno("Delete profile", f"Delete the profile '{old}'?", parent=self):
+            return
+        names = list(self.profiles)
+        target = names[names.index(old) - 1] if names.index(old) > 0 else names[1]
+        self.switch_profile(target, toast=False)
+        del self.profiles[old]
+        self.profile_menu.configure(values=list(self.profiles))
+        self.save_config()
+
+    def profile_names(self):
+        return list(self.profiles)
+
+    # ------------------------------------------------------------- marble game
+    def open_game(self):
+        if self.game is not None:
+            self.game.lift()
+            return
+        import game
+        self.show_window()
+        self.game = game.MarbleGame(self, on_close=self._game_closed)
+
+    def _game_closed(self):
+        self.game = None
 
     def _cycle_output(self):
         devs = self.audio.list_outputs()
@@ -941,7 +1266,7 @@ class App(ctk.CTk):
         if self.notify.get():
             self.toast.show(Icon.SPEAKERS, name, "Output device", theme.INFO)
 
-    def _action_changed(self, gesture):
+    def _action_changed(self, gesture, save=True):
         box = self.arg_entries[gesture]
         aid = self._action_id(gesture)
         if ACTIONS[aid][2]:
@@ -949,7 +1274,8 @@ class App(ctk.CTk):
             box.pack(fill="x", pady=(6, 0))
         else:
             box.pack_forget()
-        self.save_config()
+        if save:
+            self.save_config()
 
     def _audio_tick(self, now):
         if self.audio is None:
@@ -1024,14 +1350,53 @@ class App(ctk.CTk):
             return f"Reconnecting in {max(0, math.ceil(self.retry_at - now))} s", theme.WARN
         return "Not connected", theme.FAINT
 
+    def _battery_changed(self, level):
+        self.battery = level
+        if level > LOW_BATTERY + 5:
+            self._low_warned = False
+        elif level <= LOW_BATTERY and not self._low_warned:
+            self._low_warned = True
+            self.set_status(f"Triki battery low: {level}%", 15)
+            if self.notify.get():
+                self.toast.show("", "Triki battery low", f"{level}% left - time to charge", theme.WARN, 3.0)
+        self._update_device_info()
+
+    def _update_device_info(self):
+        cap = self.cap
+        if cap is None:
+            return
+        info = dict(cap.device_info)
+        parts = [f"Battery {self.battery}%" if self.battery is not None else None,
+                 info.get("name"), info.get("model"),
+                 f"firmware {info['firmware']}" if info.get("firmware") else None]
+        text = "  ·  ".join(p for p in parts if p) or "No device information"
+        self._set(self.dev_info, text=text)
+
     def tray_status_text(self):
         text, _ = self._conn_display(time.time())
         mic = "" if self.mic_muted is None else (" · mic muted" if self.mic_muted else " · mic on")
-        return text + mic
+        batt = f" · battery {self.battery}%" if self.battery is not None and self.cap is not None else ""
+        return text + mic + batt
 
     def _update_chrome(self, now):
         text, colour = self._conn_display(now)
         self._set(self.pill_text, text=text)
+        show_batt = self.battery is not None and self.cap is not None and self.conn_state in ("live", "calibrating", "demo")
+        if show_batt != getattr(self, "_batt_shown", False):
+            self._batt_shown = show_batt
+            if show_batt:
+                self.pill_text.pack_configure(padx=(0, 6))
+                self.pill_batt_icon.pack(side="left")
+                self.pill_batt.pack(side="left", padx=(2, 16))
+            else:
+                self.pill_batt_icon.pack_forget()
+                self.pill_batt.pack_forget()
+                self.pill_text.pack_configure(padx=(0, 16))
+        if show_batt:
+            low = self.battery <= LOW_BATTERY
+            self._set(self.pill_batt, text=f"{self.battery}%", text_color=theme.WARN if low else theme.MUTED)
+            self._set(self.pill_batt_icon, text=chr(0xE850 + max(0, min(10, round(self.battery / 10)))),
+                      text_color=theme.WARN if low else theme.MUTED)
         self._set(self.pill_dot, text_color=colour)
         connected_ui = self.want_connected or (self.simulated and self.cap is not None) or self.connecting
         if connected_ui:
@@ -1149,6 +1514,7 @@ class App(ctk.CTk):
         if cap:
             cap.stop()
         self.tray.stop()
+        self.media.stop()
         self.destroy()
 
     def toggle_startup(self):
@@ -1181,9 +1547,14 @@ class App(ctk.CTk):
             data["calibration"] = self.calib_snapshot
             data["actions"] = {g: {"action": self._action_id(g), "arg": self.action_args[g].get()}
                                for g in GESTURES}
+            self.profiles[self._current_profile] = self._profile_snapshot()
+            data["profiles"] = self.profiles
+            data["profile"] = self._current_profile
+            data["game_best"] = getattr(self, "game_best", {})
             data.update(dev_ids=self.dev_ids, dev_names=self.dev_names, ble_address=self.ble_address, ble_name=self.ble_name,
                         badge_pos=list(self.badge.pos) if getattr(self, "badge", None) and self.badge.pos
                         else self.badge_pos)
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as ex:
             self.set_status(f"Couldn't save settings: {ex}")
@@ -1216,12 +1587,23 @@ class App(ctk.CTk):
                 self.action_args[g].set(spec.get("arg", ""))
         pos = data.get("badge_pos")
         self.badge_pos = tuple(pos) if isinstance(pos, list) and len(pos) == 2 else None
+        self.game_best = data.get("game_best") or {}
+        profiles = data.get("profiles")
+        if isinstance(profiles, dict) and profiles:
+            self.profiles = profiles
+            name = data.get("profile") if data.get("profile") in profiles else next(iter(profiles))
+            self._current_profile = name
+            self.profile_name.set(name)
+            self._apply_profile_vars(profiles[name])
 
 
 def main():
     parser = argparse.ArgumentParser(description="Triki Audio")
     parser.add_argument("--tray", action="store_true", help="start hidden in the system tray")
+    parser.add_argument("--selftest", metavar="FILE", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.selftest:
+        return _selftest(args.selftest)
 
     holder = {}
     instance = system.SingleInstance(lambda: holder["app"].call_soon(holder["app"].show_window)
@@ -1235,5 +1617,32 @@ def main():
         instance.release()
 
 
+def _selftest(out_file):
+    """Start the full UI (no tray, scratch settings), run the demo for a moment, report and quit.
+    Used to check packaged builds: ``TrikiAudio.exe --selftest result.txt``."""
+    global CONFIG_FILE, OLD_CONFIG_FILE
+    import tempfile
+    tmp = Path(tempfile.mkdtemp())
+    CONFIG_FILE, OLD_CONFIG_FILE = tmp / "config.json", tmp / "none.json"
+    report = {"ok": False}
+    try:
+        app = App(selftest=True)
+        app.withdraw()
+        app.after(200, app.demo)
+
+        def finish():
+            st = app.cap.state if app.cap else None
+            report.update(ok=bool(st and st.frame > 50 and not st.calibrating), frames=st.frame if st else 0,
+                          triki=triki.__version__, audio=app.audio is not None, media=media.AVAILABLE,
+                          battery=app.battery)
+            app.quit_app()
+        app.after(4000, finish)
+        app.mainloop()
+    except Exception as ex:
+        report["error"] = repr(ex)
+    Path(out_file).write_text(json.dumps(report), encoding="utf-8")
+    return 0 if report["ok"] else 1
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

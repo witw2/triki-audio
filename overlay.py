@@ -7,6 +7,10 @@ import theme
 _KEY = "#010203"  # colour made transparent, gives us rounded corners
 
 
+def _fit(text, n):
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
 def _rounded(canvas, x1, y1, x2, y2, r, **kw):
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -39,15 +43,21 @@ class Toast:
         self.canvas.pack()
         self.win = w
 
-    def show(self, icon, text, sub="", colour=theme.ACCENT, seconds=1.6):
+    def show(self, icon, text, sub="", colour=theme.ACCENT, seconds=1.6, image=None):
+        """image: optional PIL image (e.g. album art) shown instead of the icon."""
         self._ensure()
         c = self.canvas
         c.delete("all")
         _rounded(c, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 18, fill=theme.SURFACE, outline=theme.BORDER)
-        c.create_oval(14, 12, 54, 52, fill=theme.SURFACE_2, outline="")
-        c.create_text(34, 32, text=icon, fill=colour, font=(theme.ICON_FONT, 16))
+        if image is not None:
+            from PIL import ImageTk
+            self._photo = ImageTk.PhotoImage(image.resize((44, 44)))
+            c.create_image(34, 32, image=self._photo)
+        else:
+            c.create_oval(14, 12, 54, 52, fill=theme.SURFACE_2, outline="")
+            c.create_text(34, 32, text=icon, fill=colour, font=(theme.ICON_FONT, 16))
         if sub:
-            c.create_text(68, 23, anchor="w", text=text, fill=theme.TEXT, font=(theme.FONT, 12, "bold"))
+            c.create_text(68, 23, anchor="w", text=_fit(text, 30), fill=theme.TEXT, font=(theme.FONT, 12, "bold"))
             c.create_text(68, 43, anchor="w", text=sub, fill=theme.MUTED, font=(theme.FONT, 9),
                           width=self.WIDTH - 80)
         else:

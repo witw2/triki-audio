@@ -9,3 +9,9 @@ venv/
 triki_audio_config.json
 triki_cap_config.json
 triki_audio.ico
+
+# build output
+build/
+dist/
+*.spec
+build_icon.ico

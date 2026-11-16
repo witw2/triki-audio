@@ -23,6 +23,8 @@ def _gui_python():
 
 
 def startup_command():
+    if getattr(sys, "frozen", False):            # packaged TrikiAudio.exe
+        return f'"{sys.executable}" --tray'
     return f'"{_gui_python()}" "{ENTRY_SCRIPT}" --tray'
 
 
