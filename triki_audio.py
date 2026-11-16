@@ -50,7 +50,7 @@ except Exception as _err:  # comtypes missing / not Windows
 import actions
 import system
 import theme
-from actions import ACTIONS, ARG_HINTS, BUTTON_GESTURES, DEFAULTS, GESTURES, LABEL_TO_ID
+from actions import ACTIONS, ARG_HINTS, BUTTON_GESTURES, DEFAULT_ARGS, DEFAULTS, GESTURES, LABEL_TO_ID
 import media
 from cap_view import CapView, Scope
 from overlay import MutedBadge, Toast
@@ -64,6 +64,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 OLD_CONFIG_FILE = HERE / "triki_audio_config.json"     # where older versions kept it (copied over once)
 ICON_FILE = DATA_DIR / "triki_audio.ico"
 NO_DEVICE = "Don't switch"
+PANEL_MIN, PANEL_MAX = 410, 560     # side panel width in app units (grows on big windows)
 MIC_MODES = ("Click to toggle", "Hold to talk")
 # library events the app reacts to
 TRIKI_EVENTS = ("calibrated", "twist", "flip", "tap", "double_tap", "shake", "press", "release",
@@ -122,8 +123,7 @@ class App(ctk.CTk):
         super().__init__(fg_color=theme.BG)
         system.set_app_id()
         self.title("Triki Audio")
-        self.geometry("1200x800")
-        self.minsize(1000, 700)
+        self._fit_to_screen()
         self._set_icon()
 
         f = lambda size, weight="normal": ctk.CTkFont(family=theme.FONT, size=size, weight=weight)
@@ -142,12 +142,12 @@ class App(ctk.CTk):
         self.kp = V(tk.DoubleVar, 1.5)
         self.invert_gyro = V(tk.BooleanVar, False)
         self.vol_enabled = V(tk.BooleanVar, True)
-        self.vol_deg_per_100 = V(tk.DoubleVar, 360.0)
-        self.knob_deadzone = V(tk.DoubleVar, 10.0)
+        self.vol_deg_per_100 = V(tk.DoubleVar, 1080.0)
+        self.knob_deadzone = V(tk.DoubleVar, 60.0)
         self.vol_invert = V(tk.BooleanVar, False)
         self.vol_osd = V(tk.BooleanVar, True)
         self.switch_enabled = V(tk.BooleanVar, True)
-        self.switch_hold = V(tk.DoubleVar, 0.6)
+        self.switch_hold = V(tk.DoubleVar, 0.1)
         self.auto_connect = V(tk.BooleanVar, True)
         self.close_to_tray = V(tk.BooleanVar, True)
         self.notify = V(tk.BooleanVar, True)
@@ -157,10 +157,10 @@ class App(ctk.CTk):
         self.tap_threshold = V(tk.DoubleVar, 0.15)
         self.double_tap_window = V(tk.DoubleVar, 0.5)
         self.action_vars = {g: V(tk.StringVar, ACTIONS[DEFAULTS[g]][0]) for g in GESTURES}
-        self.action_args = {g: V(tk.StringVar, "") for g in GESTURES}
+        self.action_args = {g: V(tk.StringVar, DEFAULT_ARGS.get(g, "")) for g in GESTURES}
         self._impact_hold = 0.0        # strongest knock since the last screen update (triki thread)
         self.mic_mode = V(tk.StringVar, MIC_MODES[0])
-        self.shake_force = V(tk.DoubleVar, 0.8)       # g away from gravity that counts as a shake jolt
+        self.shake_force = V(tk.DoubleVar, 2.5)       # g away from gravity that counts as a shake jolt
         self.shake_flash_until = 0.0
         self.app_twist = V(tk.BooleanVar, True)       # hold the button + twist = volume of the playing app
         self.profile_name = V(tk.StringVar, "Default")
@@ -231,6 +231,9 @@ class App(ctk.CTk):
             self.tray.start()
         self.media.start()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.bind("<F11>", lambda e: self.toggle_fullscreen())
+        self.bind("<Escape>", lambda e: self.toggle_fullscreen(False))
+        self.bind("<Configure>", self._on_resize, add="+")
 
         if start_hidden and self.tray.available:
             self.withdraw()
@@ -301,7 +304,8 @@ class App(ctk.CTk):
             chips.grid_columnconfigure(i, weight=1, uniform="chips")
             chip.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 8, 0))
 
-        tabs = ctk.CTkTabview(body, width=410, fg_color=theme.BG, corner_radius=16,
+        self.panel_width = PANEL_MIN
+        tabs = ctk.CTkTabview(body, width=PANEL_MIN, fg_color=theme.BG, corner_radius=16,
                               segmented_button_fg_color=theme.SURFACE,
                               segmented_button_selected_color=theme.SURFACE_3,
                               segmented_button_selected_hover_color=theme.SURFACE_3,
@@ -326,16 +330,59 @@ class App(ctk.CTk):
         ctk.CTkLabel(foot, text=f"triki {triki.__version__}", font=F["small"], text_color=theme.FAINT)\
             .pack(side="right")
 
+    # ------------------------------------------------------------------ window size
+    def _fit_to_screen(self):
+        """Size and centre the window for the screen it opens on (also small / high-DPI laptops)."""
+        self._wrapped, self._scrolls = [], []
+        self._resize_job = None
+        scale = ctk.ScalingTracker.get_window_scaling(self) or 1.0
+        sw, sh = self.winfo_screenwidth() / scale, self.winfo_screenheight() / scale   # in app units
+        w, h = int(min(1200, sw * 0.9)), int(min(820, sh * 0.88))
+        self.minsize(int(min(940, sw * 0.95)), int(min(640, sh * 0.85)))
+        x, y = int((sw - w) / 2 * scale), int((sh - h) / 2.4 * scale)
+        self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+
+    def toggle_fullscreen(self, on=None):
+        on = (not self.attributes("-fullscreen")) if on is None else on
+        if on == bool(self.attributes("-fullscreen")):
+            return
+        self.attributes("-fullscreen", on)
+        if on:
+            self.set_status("Full screen - press F11 or Esc to leave", 4)
+
+    def _on_resize(self, event):
+        if event.widget is not self:
+            return
+        if self._resize_job:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(120, self._apply_panel_width)
+
+    def _apply_panel_width(self):
+        """Give the side panel more room on big windows, and re-wrap its texts."""
+        self._resize_job = None
+        scale = ctk.ScalingTracker.get_window_scaling(self) or 1.0
+        width = int(max(PANEL_MIN, min(PANEL_MAX, self.winfo_width() / scale * 0.27)))
+        if abs(width - self.panel_width) < 8:
+            return
+        self.panel_width = width
+        self.tabs.configure(width=width)
+        for frame in self._scrolls:
+            frame.configure(width=width - 30)
+        for label, pad in self._wrapped:
+            label.configure(wraplength=width - pad)
+
     def _scroll(self, tab):
-        frame = ctk.CTkScrollableFrame(tab, fg_color="transparent", width=380,
+        frame = ctk.CTkScrollableFrame(tab, fg_color="transparent", width=PANEL_MIN - 30,
                                        scrollbar_button_color=theme.SURFACE_2,
                                        scrollbar_button_hover_color=theme.SURFACE_3)
         frame.pack(fill="both", expand=True)
+        self._scrolls.append(frame)
         return frame
 
     def _label(self, parent, text, muted=True, font="small", **pack):
         lbl = ctk.CTkLabel(parent, text=text, font=self.fonts[font], anchor="w", justify="left",
-                           text_color=theme.MUTED if muted else theme.TEXT, wraplength=330)
+                           text_color=theme.MUTED if muted else theme.TEXT, wraplength=self.panel_width - 80)
+        self._wrapped.append((lbl, 80))
         lbl.pack(fill="x", **pack)
         return lbl
 
@@ -396,10 +443,12 @@ class App(ctk.CTk):
         texts = ctk.CTkFrame(row, fg_color="transparent")
         texts.pack(side="left", fill="x", expand=True, padx=(12, 0))
         self.np_title = ctk.CTkLabel(texts, text="Nothing playing", font=F["h2"], text_color=theme.TEXT,
-                                     anchor="w", justify="left", wraplength=230)
+                                     anchor="w", justify="left", wraplength=self.panel_width - 180)
         self.np_title.pack(fill="x")
         self.np_sub = ctk.CTkLabel(texts, text="Start music or a video in any app", font=F["small"],
-                                   text_color=theme.MUTED, anchor="w", justify="left", wraplength=230)
+                                   text_color=theme.MUTED, anchor="w", justify="left",
+                                   wraplength=self.panel_width - 180)
+        self._wrapped += [(self.np_title, 180), (self.np_sub, 180)]
         self.np_sub.pack(fill="x")
         btns = ctk.CTkFrame(np_card.body, fg_color="transparent")
         btns.pack(pady=(10, 0))
@@ -1006,7 +1055,7 @@ class App(ctk.CTk):
         if not hasattr(self, "mic_hint"):
             return
         self.mic_hint.configure(text="Hold the cap's button to talk - you're muted the rest of the time." if self._ptt
-                                else "Click the cap's button to mute or unmute (change it on the Actions "
+                                else "Hold the cap's button to mute or unmute (change it on the Actions "
                                      "tab). You can also click here.")
 
     def _change_app_volume(self, degrees):
@@ -1157,7 +1206,7 @@ class App(ctk.CTk):
 
     def _apply_profile_vars(self, prof):
         for g in GESTURES:
-            spec = (prof.get("actions") or {}).get(g, {"action": DEFAULTS[g]})
+            spec = (prof.get("actions") or {}).get(g, {"action": DEFAULTS[g], "arg": DEFAULT_ARGS.get(g, "")})
             aid = spec.get("action") if spec.get("action") in ACTIONS else DEFAULTS[g]
             self.action_vars[g].set(ACTIONS[aid][0])
             self.action_args[g].set(spec.get("arg", ""))
@@ -1319,7 +1368,7 @@ class App(ctk.CTk):
             self.rate = max(0.0, (st.frame - self._rate_mark[1]) / (now - self._rate_mark[0]))
             self._rate_mark = (now, st.frame)
         self._update_chrome(now)
-        if self.state() == "normal":
+        if self.state() not in ("withdrawn", "iconic"):   # also when maximised ("zoomed")
             self._render(st)
         self.after(33, self._tick)
 

@@ -9,10 +9,11 @@ Turn the **Triki** bottle-cap controller into a desk audio remote for Windows.
 | **twist** the cap clockwise / counter-clockwise | volume up / down (with the Windows volume overlay) |
 | **hold the button + twist** | volume of just the app that's playing (e.g. Spotify) |
 | **flip** it face up / face down | switch between two output devices (e.g. speakers ↔ headset) |
-| **click** the button | mute / unmute the microphone - or **hold to talk** |
-| **double-tap the table** next to it | play / pause |
-| **shake** it | toggle shuffle |
-| double-click, hold the button | free to assign |
+| **click** the button | play / pause |
+| **double-click** the button | next track |
+| **hold** the button | mute / unmute the microphone - or use **hold to talk** |
+| **double-tap the table** next to it | previous track |
+| **shake** it (firmly) | open Spotify in the browser |
 
 Every click, tap and shake can be set to: mute the mic, play/pause,
 next / previous track, shuffle, mute the speakers, switch output device,

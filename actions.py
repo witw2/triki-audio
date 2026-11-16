@@ -31,8 +31,9 @@ GESTURES = {
     "shake": "Shake",
 }
 BUTTON_GESTURES = ("click", "double_click", "long_press")
-DEFAULTS = {"click": "mic", "double_click": "none", "long_press": "none", "double_tap": "play_pause",
-            "shake": "shuffle"}
+DEFAULTS = {"click": "play_pause", "double_click": "next", "long_press": "mic", "double_tap": "prev",
+            "shake": "open"}
+DEFAULT_ARGS = {"shake": "https://open.spotify.com/"}
 
 ARG_HINTS = {
     "shortcut": "e.g. ctrl+shift+m  or  win+d",
