@@ -73,7 +73,6 @@ class Tray:
                 pystray.MenuItem(name, (lambda n: (lambda icon, item: a.call_soon(lambda: a.switch_profile(n))))(name),
                                  checked=(lambda n: (lambda item: a._current_profile == n))(name), radio=True)
                 for name in a.profile_names()))),
-            pystray.MenuItem("Play the marble game", on_gui(a.open_game)),
             pystray.MenuItem("Start with Windows", on_gui(a.toggle_startup),
                              checked=lambda item: a.startup_enabled),
             pystray.Menu.SEPARATOR,

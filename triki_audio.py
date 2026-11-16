@@ -35,7 +35,7 @@ except ImportError:  # not installed: use the copy next to this project
     import triki
 from triki.orientation import dot
 
-MIN_TRIKI = (0, 5, 0)   # tilt, shake and battery
+MIN_TRIKI = (0, 5, 0)   # shake and battery
 if tuple(int(x) for x in triki.__version__.split(".")[:3]) < MIN_TRIKI:
     raise SystemExit(f"Triki Audio needs triki {'.'.join(map(str, MIN_TRIKI))} or newer "
                      f"(found {triki.__version__}). Run: pip install -U -r requirements.txt")
@@ -65,8 +65,8 @@ OLD_CONFIG_FILE = HERE / "triki_audio_config.json"     # where older versions ke
 ICON_FILE = DATA_DIR / "triki_audio.ico"
 NO_DEVICE = "Don't switch"
 MIC_MODES = ("Click to toggle", "Hold to talk")
-# library events the app reacts to (tilt_left etc. are app-side names for the 'tilt' event)
-TRIKI_EVENTS = ("calibrated", "twist", "flip", "tap", "double_tap", "tilt", "shake", "press", "release",
+# library events the app reacts to
+TRIKI_EVENTS = ("calibrated", "twist", "flip", "tap", "double_tap", "shake", "press", "release",
                 "click", "single_click", "double_click", "long_press", "battery")
 LOW_BATTERY = 15
 LAYOUTS = {"Auto": "auto", "ABC=gyro, DEF=accel": "gyro_first", "ABC=accel, DEF=gyro": "accel_first"}
@@ -160,11 +160,12 @@ class App(ctk.CTk):
         self.action_args = {g: V(tk.StringVar, "") for g in GESTURES}
         self._impact_hold = 0.0        # strongest knock since the last screen update (triki thread)
         self.mic_mode = V(tk.StringVar, MIC_MODES[0])
+        self.shake_force = V(tk.DoubleVar, 0.8)       # g away from gravity that counts as a shake jolt
+        self.shake_flash_until = 0.0
         self.app_twist = V(tk.BooleanVar, True)       # hold the button + twist = volume of the playing app
         self.profile_name = V(tk.StringVar, "Default")
         self.profiles = {}                            # name -> settings snapshot
         self._current_profile = "Default"
-        self.game_best = {}
         self.battery = None
         self._low_warned = False
         self._held_target = None                      # app whose volume this press is changing
@@ -172,7 +173,6 @@ class App(ctk.CTk):
         self._app_level = None
         self.now_playing = None
         self._media_toast_until = 0.0
-        self.game = None
         self.media = media.MediaWatcher(lambda np: self.call_soon(lambda np=np: self._now_playing_changed(np)))
         self.impact_peak = 0.0
         self.flash_text, self.flash_until = "", 0.0
@@ -270,9 +270,6 @@ class App(ctk.CTk):
                                       fg_color=theme.ACCENT, hover_color=theme.ACCENT_HOVER,
                                       text_color=theme.ACCENT_TEXT)
         self.conn_btn.pack(side="right")
-        ctk.CTkButton(head, text="", width=38, height=38, corner_radius=19, font=F["icon"],
-                      fg_color=theme.SURFACE, hover_color=theme.SURFACE_3, text_color=theme.TEXT,
-                      border_width=1, border_color=theme.BORDER, command=self.open_game)            .pack(side="right", padx=(0, 10))
         pill = ctk.CTkFrame(head, fg_color=theme.SURFACE, corner_radius=19, height=38,
                             border_width=1, border_color=theme.BORDER)
         pill.pack(side="right", padx=(0, 10))
@@ -524,9 +521,17 @@ class App(ctk.CTk):
                 box.hint.configure(text=ARG_HINTS[aid])
                 box.pack(fill="x", pady=(6, 0))
         self._label(card.body, "Twist (volume) and flip (output device) are set on the Controls tab. "
-                               "Tilt = tip the cap onto an edge and hold; it repeats while held. "
                                "Button gestures are off while the mic is in 'Hold to talk' mode. "
                                "Actions only run while a real Triki is connected.", pady=(6, 0))
+
+        shake = Card(root, "\uE7C9", "Shake", F, icon_colour=theme.INFO)
+        shake.pack(fill="x", pady=(0, 12))
+        self.shake_flash = ctk.CTkLabel(shake.body, text="", font=F["button"], text_color=theme.MUTED)
+        self.shake_flash.pack(fill="x", pady=(0, 2))
+        self._slider_row(shake.body, "Shake force needed", self.shake_force, 0.4, 2.5,
+                         lambda v: f"{v:.1f} g", steps=21)
+        self._label(shake.body, "Higher = you have to shake harder. Raise it if the cap 'shakes' when "
+                                "you just pick it up.", pady=(0, 0))
 
         taps = Card(root, "\uE945", "Table taps", F, icon_colour=theme.INFO)
         taps.pack(fill="x", pady=(0, 12))
@@ -653,6 +658,7 @@ class App(ctk.CTk):
             cfg.upside_down = bool(self.upside_down.get())
             cfg.tap_threshold_g = float(self.tap_threshold.get())
             cfg.double_tap_s = float(self.double_tap_window.get())
+            cfg.shake_threshold_g = float(self.shake_force.get())
         except (tk.TclError, ValueError):
             pass  # half-typed value - keep the previous settings
         return cfg
@@ -967,9 +973,9 @@ class App(ctk.CTk):
                     self._set_mic(True)
             elif e.name == "battery":
                 self._battery_changed(e.value)
-            elif e.name == "tilt":
-                self._gesture("tilt_" + e.value)
             elif e.name in GESTURES or e.name == "single_click":
+                if e.name == "shake":
+                    self.shake_flash_until = time.time() + 1.5
                 self._gesture(e.name)
             elif e.name == "tap":
                 self._flash(f"Tap  ({e.value:.2f} g)")
@@ -1043,8 +1049,6 @@ class App(ctk.CTk):
         if name in BUTTON_GESTURES or name == "single_click":
             if self._ptt or self._held_twisted:     # the button is busy with talk / app volume
                 return
-        if self.game is not None and name.startswith(("tilt", "shake", "double_tap")):
-            return                                  # the marble game owns tilting right now
         if name in ("click", "single_click"):
             # With a double-click action set, a click must wait to see whether a second one follows.
             wait = self._action_id("double_click") != "none"
@@ -1077,9 +1081,6 @@ class App(ctk.CTk):
                 return
             if aid == "next_profile":
                 self._next_profile()
-                return
-            if aid == "game":
-                self.open_game()
                 return
             if aid == "mute":
                 actions.tap_key(actions.VK["volumemute"])   # Windows shows its own overlay
@@ -1239,18 +1240,6 @@ class App(ctk.CTk):
 
     def profile_names(self):
         return list(self.profiles)
-
-    # ------------------------------------------------------------- marble game
-    def open_game(self):
-        if self.game is not None:
-            self.game.lift()
-            return
-        import game
-        self.show_window()
-        self.game = game.MarbleGame(self, on_close=self._game_closed)
-
-    def _game_closed(self):
-        self.game = None
 
     def _cycle_output(self):
         devs = self.audio.list_outputs()
@@ -1478,6 +1467,9 @@ class App(ctk.CTk):
             flash = self.flash_text if time.time() < self.flash_until else ""
             self._set(self.tap_flash, text=flash or "Knock twice next to the cap to try it")
             self._set(self.tap_flash, text_color=theme.GOOD if flash else theme.MUTED)
+            shook = time.time() < self.shake_flash_until
+            self._set(self.shake_flash, text="Shake!" if shook else "Shake the cap to try it",
+                      text_color=theme.GOOD if shook else theme.MUTED)
         if self.tabs.get() == "Sensor":
             a = st.accel_g
             self.stat["Roll"].set(f"{st.roll:+.1f}°")
@@ -1538,7 +1530,7 @@ class App(ctk.CTk):
     # ------------------------------------------------------------- config
     CONFIG_KEYS = ("layout", "gyro_scale", "odr", "kp", "invert_gyro", "vol_enabled", "vol_deg_per_100",
                    "knob_deadzone", "vol_invert", "vol_osd", "switch_enabled", "switch_hold",
-                   "tap_threshold", "double_tap_window",
+                   "tap_threshold", "double_tap_window", "shake_force",
                    "auto_connect", "close_to_tray", "notify", "mic_badge", "upside_down")
 
     def save_config(self):
@@ -1550,7 +1542,6 @@ class App(ctk.CTk):
             self.profiles[self._current_profile] = self._profile_snapshot()
             data["profiles"] = self.profiles
             data["profile"] = self._current_profile
-            data["game_best"] = getattr(self, "game_best", {})
             data.update(dev_ids=self.dev_ids, dev_names=self.dev_names, ble_address=self.ble_address, ble_name=self.ble_name,
                         badge_pos=list(self.badge.pos) if getattr(self, "badge", None) and self.badge.pos
                         else self.badge_pos)
@@ -1587,7 +1578,6 @@ class App(ctk.CTk):
                 self.action_args[g].set(spec.get("arg", ""))
         pos = data.get("badge_pos")
         self.badge_pos = tuple(pos) if isinstance(pos, list) and len(pos) == 2 else None
-        self.game_best = data.get("game_best") or {}
         profiles = data.get("profiles")
         if isinstance(profiles, dict) and profiles:
             self.profiles = profiles

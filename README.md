@@ -11,11 +11,10 @@ Turn the **Triki** bottle-cap controller into a desk audio remote for Windows.
 | **flip** it face up / face down | switch between two output devices (e.g. speakers ↔ headset) |
 | **click** the button | mute / unmute the microphone - or **hold to talk** |
 | **double-tap the table** next to it | play / pause |
-| **tilt** it left / right and hold | previous / next track (repeats while held) |
 | **shake** it | toggle shuffle |
-| double-click, hold, tilt forward / back | free to assign |
+| double-click, hold the button | free to assign |
 
-Every click, tap, tilt and shake can be set to: mute the mic, play/pause,
+Every click, tap and shake can be set to: mute the mic, play/pause,
 next / previous track, shuffle, mute the speakers, switch output device,
 switch profile, **any keyboard shortcut**, or **open an app or website**.
 
@@ -28,7 +27,6 @@ Also:
 * **Sleep-aware** - when the cap dozes off, press its button and it's back in seconds.
 * Runs in the **tray**, can **start with Windows**, shows a **"Muted" badge** while
   your mic is off.
-* A little **marble maze** you play by tilting the cap.
 
 > Unofficial. Not affiliated with the maker of the Triki. Built on the
 > [triki-py](https://github.com/witw2/triki-py) library.
@@ -58,14 +56,14 @@ or double-click **`Triki Audio.pyw`** (no console window).
 2. Keep the cap still for a second while it calibrates (only needed once -
    the calibration is remembered).
 3. **Controls** tab → pick an output device for *face up* and *face down*.
-4. **Actions** tab → choose what clicks, taps, tilts and shakes do.
+4. **Actions** tab → choose what clicks, taps and shakes do.
 
 No cap at hand? **Device → Try demo** simulates one (your audio is left alone).
 
 ## Running in the background
 
 * Closing the window hides it to the **tray** (the gold cap icon). Right-click
-  it for quick controls, profiles, the game, or **Quit**.
+  it for quick controls, profiles, or **Quit**.
 * **Device → Start with Windows** starts it hidden in the tray when you sign in.
 * It remembers your Triki and reconnects automatically, also after the cap
   went to sleep (press the cap's button to wake it).
@@ -79,8 +77,7 @@ No cap at hand? **Device → Try demo** simulates one (your audio is left alone)
 * **Volume moves too fast or slow?** Controls → *Full sweep*.
 * **Hold to talk:** Controls → Microphone → *Hold to talk*. You're muted except
   while the button is held. Other button gestures are paused in this mode.
-* **Tilt direction:** the speaker logo on the cap in the 3D view points to the
-  *right* edge. Tilts and the marble game follow the logo.
+* **Shake too easy or too hard?** Actions → *Shake force needed*.
 * **Table taps too sensitive (or not enough)?** Actions → *Table taps* has a
   live meter: knock a few times and set *Knock needed* just below your knocks.
 * **Pop-ups / muted badge:** Controls → *Notifications*.
@@ -107,7 +104,6 @@ a release.
 triki_audio.py   app window, connection, gestures -> actions, profiles
 actions.py       media keys, keyboard shortcuts, launching apps
 media.py         now playing + media control (Windows media sessions)
-game.py          the marble maze
 cap_view.py      3D bottle-cap renderer and sensor charts
 overlay.py       pop-up notifications and the "Muted" badge
 tray.py          system-tray icon and menu

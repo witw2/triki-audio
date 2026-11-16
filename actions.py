@@ -17,7 +17,6 @@ ACTIONS = {
     "output_cycle": ("Switch output device", Icon.SPEAKERS, False),
     "shuffle": ("Toggle shuffle", "", False),
     "next_profile": ("Next profile", "", False),
-    "game": ("Open the marble game", "", False),
     "shortcut": ("Keyboard shortcut...", "\uE765", True),
     "open": ("Open app or website...", "\uE8A7", True),
 }
@@ -29,15 +28,10 @@ GESTURES = {
     "double_click": "Double-click the button",
     "long_press": "Hold the button",
     "double_tap": "Double-tap the table",
-    "tilt_left": "Tilt left",
-    "tilt_right": "Tilt right",
-    "tilt_forward": "Tilt forward",
-    "tilt_back": "Tilt back",
     "shake": "Shake",
 }
 BUTTON_GESTURES = ("click", "double_click", "long_press")
 DEFAULTS = {"click": "mic", "double_click": "none", "long_press": "none", "double_tap": "play_pause",
-            "tilt_left": "prev", "tilt_right": "next", "tilt_forward": "none", "tilt_back": "none",
             "shake": "shuffle"}
 
 ARG_HINTS = {
